@@ -2,7 +2,11 @@
 name = "tcap"
 version = "0.1.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "TCAP (Transaction Capabilities Application Part) codec per ITU-T Q.771-Q.775"
+license = "MIT"
+repository = "https://github.com/killdashnine/tcap"
 
 [dependencies]
+rasn = "0.28"
+hex = "0.4"
+thiserror = "2"
