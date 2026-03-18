@@ -45,119 +45,16 @@ pub use types::{ErrorCode, InvokeId, OperationCode};
 
 /// Encode a TCAP message to wire-correct BER bytes.
 ///
-/// `rasn` encodes struct-based choice variants as `[APPLICATION N] { SEQUENCE { fields } }`,
-/// but ITU-T Q.773 uses implicit tagging where the APPLICATION tag replaces SEQUENCE:
-/// `[APPLICATION N] { fields }`. This function strips the redundant inner SEQUENCE.
+/// With implicit APPLICATION tags, rasn directly produces Q.773-compliant encoding.
 pub fn encode(msg: &TcapMessage) -> Result<Vec<u8>, TcapError> {
     let raw = rasn::ber::encode(msg)?;
-    Ok(strip_inner_sequence(&raw))
+    Ok(raw)
 }
 
 /// Decode a TCAP message from wire-correct BER bytes.
-///
-/// Re-inserts the inner SEQUENCE wrapper that `rasn` expects before decoding.
 pub fn decode(bytes: &[u8]) -> Result<TcapMessage, TcapError> {
-    let wrapped = insert_inner_sequence(bytes);
-    let msg = rasn::ber::decode::<TcapMessage>(&wrapped)?;
+    let msg = rasn::ber::decode::<TcapMessage>(bytes)?;
     Ok(msg)
-}
-
-/// Strip the inner SEQUENCE (0x30) that rasn adds inside the APPLICATION tag.
-///
-/// Input:  `62 LL 30 LL' <fields>`  (rasn output)
-/// Output: `62 LL' <fields>`        (wire-correct Q.773)
-fn strip_inner_sequence(bytes: &[u8]) -> Vec<u8> {
-    if bytes.len() < 4 {
-        return bytes.to_vec();
-    }
-
-    // Parse outer tag + length
-    let outer_tag = bytes[0];
-    let (outer_len_size, _outer_len) = parse_ber_length(&bytes[1..]);
-    let content_start = 1 + outer_len_size;
-
-    // Check if content starts with SEQUENCE (0x30)
-    if content_start < bytes.len() && bytes[content_start] == 0x30 {
-        let (seq_len_size, seq_len) = parse_ber_length(&bytes[content_start + 1..]);
-        let fields_start = content_start + 1 + seq_len_size;
-
-        // Rebuild: outer_tag + new_length + fields (without the SEQUENCE wrapper)
-        let fields = &bytes[fields_start..fields_start + seq_len];
-        let mut result = Vec::with_capacity(1 + 4 + fields.len());
-        result.push(outer_tag);
-        encode_ber_length(&mut result, fields.len());
-        result.extend_from_slice(fields);
-        result
-    } else {
-        bytes.to_vec()
-    }
-}
-
-/// Insert an inner SEQUENCE (0x30) wrapper inside the APPLICATION tag.
-///
-/// Input:  `62 LL' <fields>`        (wire Q.773)
-/// Output: `62 LL 30 LL' <fields>`  (what rasn expects)
-fn insert_inner_sequence(bytes: &[u8]) -> Vec<u8> {
-    if bytes.len() < 2 {
-        return bytes.to_vec();
-    }
-
-    let outer_tag = bytes[0];
-    let (outer_len_size, outer_len) = parse_ber_length(&bytes[1..]);
-    let content_start = 1 + outer_len_size;
-
-    // Check if content already starts with SEQUENCE — if so, no wrapping needed
-    if content_start < bytes.len() && bytes[content_start] == 0x30 {
-        return bytes.to_vec();
-    }
-
-    let content = &bytes[content_start..content_start + outer_len];
-
-    // Build SEQUENCE wrapper around content
-    let mut seq = vec![0x30];
-    encode_ber_length(&mut seq, content.len());
-    seq.extend_from_slice(content);
-
-    // Rebuild outer
-    let mut result = Vec::with_capacity(1 + 4 + seq.len());
-    result.push(outer_tag);
-    encode_ber_length(&mut result, seq.len());
-    result.extend_from_slice(&seq);
-    result
-}
-
-/// Parse a BER length field. Returns (bytes consumed, length value).
-fn parse_ber_length(bytes: &[u8]) -> (usize, usize) {
-    if bytes.is_empty() {
-        return (0, 0);
-    }
-    if bytes[0] & 0x80 == 0 {
-        // Short form
-        (1, bytes[0] as usize)
-    } else {
-        let num_bytes = (bytes[0] & 0x7F) as usize;
-        let mut len = 0usize;
-        for i in 0..num_bytes {
-            if 1 + i < bytes.len() {
-                len = (len << 8) | (bytes[1 + i] as usize);
-            }
-        }
-        (1 + num_bytes, len)
-    }
-}
-
-/// Encode a BER length field.
-fn encode_ber_length(buf: &mut Vec<u8>, len: usize) {
-    if len < 128 {
-        buf.push(len as u8);
-    } else if len < 256 {
-        buf.push(0x81);
-        buf.push(len as u8);
-    } else {
-        buf.push(0x82);
-        buf.push((len >> 8) as u8);
-        buf.push((len & 0xFF) as u8);
-    }
 }
 
 #[cfg(test)]

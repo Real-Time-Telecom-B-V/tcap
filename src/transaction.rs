@@ -17,15 +17,15 @@ use crate::types::TransactionId;
 #[derive(Debug, Clone, PartialEq, Eq, rasn::AsnType, rasn::Decode, rasn::Encode)]
 #[rasn(choice)]
 pub enum TcapMessage {
-    #[rasn(tag(explicit(application, 1)))]
+    #[rasn(tag(application, 1))]
     Unidirectional(Unidirectional),
-    #[rasn(tag(explicit(application, 2)))]
+    #[rasn(tag(application, 2))]
     Begin(Begin),
-    #[rasn(tag(explicit(application, 4)))]
+    #[rasn(tag(application, 4))]
     End(End),
-    #[rasn(tag(explicit(application, 5)))]
+    #[rasn(tag(application, 5))]
     Continue(Continue),
-    #[rasn(tag(explicit(application, 7)))]
+    #[rasn(tag(application, 7))]
     Abort(Abort),
 }
 
@@ -70,9 +70,9 @@ impl fmt::Display for TcapMessage {
 /// Unidirectional message — no transaction, fire-and-forget.
 #[derive(Debug, Clone, PartialEq, Eq, rasn::AsnType, rasn::Decode, rasn::Encode)]
 pub struct Unidirectional {
-    #[rasn(tag(explicit(application, 11)))]
+    #[rasn(tag(application, 11))]
     pub dialogue_portion: Option<DialoguePortion>,
-    #[rasn(tag(explicit(application, 12)))]
+    #[rasn(tag(application, 12))]
     pub components: Vec<Component>,
 }
 
@@ -80,11 +80,11 @@ pub struct Unidirectional {
 #[derive(Debug, Clone, PartialEq, Eq, rasn::AsnType, rasn::Decode, rasn::Encode)]
 pub struct Begin {
     /// Originating Transaction ID.
-    #[rasn(tag(explicit(application, 8)))]
+    #[rasn(tag(application, 8))]
     pub otid: TransactionId,
-    #[rasn(tag(explicit(application, 11)))]
+    #[rasn(tag(application, 11))]
     pub dialogue_portion: Option<DialoguePortion>,
-    #[rasn(tag(explicit(application, 12)))]
+    #[rasn(tag(application, 12))]
     pub components: Option<Vec<Component>>,
 }
 
@@ -92,11 +92,11 @@ pub struct Begin {
 #[derive(Debug, Clone, PartialEq, Eq, rasn::AsnType, rasn::Decode, rasn::Encode)]
 pub struct End {
     /// Destination Transaction ID.
-    #[rasn(tag(explicit(application, 9)))]
+    #[rasn(tag(application, 9))]
     pub dtid: TransactionId,
-    #[rasn(tag(explicit(application, 11)))]
+    #[rasn(tag(application, 11))]
     pub dialogue_portion: Option<DialoguePortion>,
-    #[rasn(tag(explicit(application, 12)))]
+    #[rasn(tag(application, 12))]
     pub components: Option<Vec<Component>>,
 }
 
@@ -104,14 +104,14 @@ pub struct End {
 #[derive(Debug, Clone, PartialEq, Eq, rasn::AsnType, rasn::Decode, rasn::Encode)]
 pub struct Continue {
     /// Originating Transaction ID.
-    #[rasn(tag(explicit(application, 8)))]
+    #[rasn(tag(application, 8))]
     pub otid: TransactionId,
     /// Destination Transaction ID.
-    #[rasn(tag(explicit(application, 9)))]
+    #[rasn(tag(application, 9))]
     pub dtid: TransactionId,
-    #[rasn(tag(explicit(application, 11)))]
+    #[rasn(tag(application, 11))]
     pub dialogue_portion: Option<DialoguePortion>,
-    #[rasn(tag(explicit(application, 12)))]
+    #[rasn(tag(application, 12))]
     pub components: Option<Vec<Component>>,
 }
 
@@ -119,9 +119,9 @@ pub struct Continue {
 #[derive(Debug, Clone, PartialEq, Eq, rasn::AsnType, rasn::Decode, rasn::Encode)]
 pub struct Abort {
     /// Destination Transaction ID.
-    #[rasn(tag(explicit(application, 9)))]
+    #[rasn(tag(application, 9))]
     pub dtid: TransactionId,
     /// P-Abort cause or dialogue abort from user.
-    #[rasn(tag(explicit(application, 10)))]
+    #[rasn(tag(application, 10))]
     pub reason: Option<rasn::types::Any>,
 }

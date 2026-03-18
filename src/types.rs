@@ -9,9 +9,7 @@ pub type TransactionId = rasn::types::OctetString;
 #[derive(Debug, Clone, PartialEq, Eq, rasn::AsnType, rasn::Decode, rasn::Encode)]
 #[rasn(choice)]
 pub enum OperationCode {
-    #[rasn(tag(context, 0))]
     Local(i64),
-    #[rasn(tag(context, 1))]
     Global(rasn::types::ObjectIdentifier),
 }
 
@@ -28,9 +26,7 @@ impl fmt::Display for OperationCode {
 #[derive(Debug, Clone, PartialEq, Eq, rasn::AsnType, rasn::Decode, rasn::Encode)]
 #[rasn(choice)]
 pub enum ErrorCode {
-    #[rasn(tag(context, 0))]
     Local(i64),
-    #[rasn(tag(context, 1))]
     Global(rasn::types::ObjectIdentifier),
 }
 
