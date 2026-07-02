@@ -37,6 +37,9 @@ pub mod error;
 pub mod transaction;
 pub mod types;
 
+#[cfg(feature = "python")]
+pub mod python;
+
 pub use component::{Component, Invoke, Reject, ReturnError, ReturnResult, ReturnResultValue};
 pub use dialogue::DialoguePortion;
 pub use error::TcapError;

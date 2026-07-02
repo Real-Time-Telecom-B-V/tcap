@@ -5,10 +5,12 @@
 [![CI](https://github.com/Real-Time-Telecom-B-V/tcap/actions/workflows/ci.yml/badge.svg)](https://github.com/Real-Time-Telecom-B-V/tcap/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A pure-Rust **TCAP (Transaction Capabilities Application Part)** codec — the SS7
+A **TCAP (Transaction Capabilities Application Part)** codec — the SS7
 transaction-and-component layer that carries MAP, CAP, and INAP dialogues.
 Implements the ITU-T **Q.771–Q.775** message set over BER (X.690): the five
-transaction PDUs, the component sub-layer, and the dialogue portion.
+transaction PDUs, the component sub-layer, and the dialogue portion. Shipped as
+both a **Rust crate** (`cargo add tcap`) and a **Rust-backed Python wheel**
+(`pip install ss7-tcap`, imported as `tcap`) from one source tree, one version.
 
 TCAP is where an SS7 application conversation lives. Below it, **SCCP** provides
 the global-title routing and **M3UA**/**MTP3** the network transport; above it,
@@ -75,12 +77,62 @@ transaction/component codec rather than a full MAP stack.
 
 More: [`docs/OVERVIEW.md`](docs/OVERVIEW.md).
 
-## Development
+## Python
+
+The same codec is available as a Rust-backed wheel. The name `tcap` is taken on
+PyPI, so the distribution is **`ss7-tcap`** — but the import name is `tcap`:
 
 ```bash
-cargo test
+pip install ss7-tcap
+```
+
+```python
+import tcap
+
+# Build a Begin carrying an Invoke (e.g. a MAP operation) …
+begin = tcap.Begin(
+    b"\x00\x00\x00\x01",  # originating transaction id (OTID)
+    components=[
+        tcap.Invoke(1, tcap.OperationCode.local(45), parameter=b"\x04\x03\x01\x02\x03"),
+    ],
+)
+
+wire = begin.encode()          # Q.773-compliant BER bytes
+assert wire[0] == tcap.TAG_BEGIN  # 0x62 = [APPLICATION 2] CONSTRUCTED
+
+msg = tcap.decode(wire)        # -> a Begin
+assert msg.components[0].operation_code == tcap.OperationCode.local(45)
+```
+
+The Python surface mirrors the Rust one: the transaction messages (`Begin`,
+`Continue`, `End`, `Abort`, `Unidirectional`), the components (`Invoke`,
+`ReturnResult`, `ReturnError`, `Reject`), `OperationCode` / `ErrorCode`
+(local integer or global OID), plus `encode()` / `decode()` and the Q.773
+tag / component-type constants. Opaque fields (operation arguments, the dialogue
+`EXTERNAL`, a `Reject` problem) are `bytes`, exactly as the Rust codec keeps them.
+The module is declared `gil_used = false`, so it loads on free-threaded CPython.
+
+## Development
+
+Rust:
+
+```bash
+cargo test                                  # unit + integration + doctest
+cargo test --features python                # the PyO3 bindings
 cargo clippy --all-targets -- -D warnings
+cargo clippy --features python --lib -- -D warnings
+cargo bench --no-run                        # keep the benches compiling
+cargo run --release --example leak_check    # counting-allocator leak gate → PASS
 cargo deny check
+```
+
+Python (wheel):
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install maturin pytest
+maturin develop                             # build + install the extension
+pytest python/tests -q
 ```
 
 ## License

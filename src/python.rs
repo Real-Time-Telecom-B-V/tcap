@@ -1,0 +1,970 @@
+//! PyO3 bindings — `pip install ss7-tcap` gives a Rust-backed wheel exposing the
+//! **same** TCAP (ITU-T Q.771–Q.775) BER codec the crate ships.
+//!
+//! Compiled only with `--features python`; the default crate build is pyo3-free, so
+//! `cargo add tcap` / crates.io consumers pull zero pyo3. Two entry points share one
+//! `add_contents()`:
+//! * `#[pymodule] fn _tcap` — the standalone wheel (maturin `module-name`).
+//! * `pub fn register(py, parent)` — mount `tcap` as a submodule of another
+//!   extension, so a host can expose tcap without a second shared object.
+//!
+//! The Python surface is a faithful mirror of the Rust one. TCAP messages carry
+//! opaque, application-decoded content (operation arguments, the dialogue
+//! `EXTERNAL`, a `Reject` problem) as raw BER — so those fields are `bytes` on the
+//! Python side, exactly as the Rust codec keeps them as `rasn::types::Any`.
+//! Transaction ids (OTID/DTID) are `bytes`; invoke ids and local operation/error
+//! codes are `int`. Each message class builds and `.encode() -> bytes`; the
+//! module-level `decode(bytes)` dispatches on the transaction tag and returns the
+//! matching class.
+
+use pyo3::create_exception;
+use pyo3::exceptions::PyException;
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyModule};
+
+use rasn::types::{Any, ObjectIdentifier, OctetString};
+
+use crate::{
+    Abort, Begin, Component, Continue, DialoguePortion, End, ErrorCode, Invoke, OperationCode,
+    Reject, ReturnError, ReturnResult, ReturnResultValue, TcapError as CoreTcapError, TcapMessage,
+    Unidirectional,
+};
+
+// ── Error mapping ───────────────────────────────────────────────────────────
+create_exception!(
+    tcap,
+    TcapError,
+    PyException,
+    "TCAP protocol / codec error (ITU-T Q.771–Q.775)."
+);
+
+fn tcap_err(e: CoreTcapError) -> PyErr {
+    TcapError::new_err(e.to_string())
+}
+
+// ── Q.773 transaction tags (APPLICATION class) ──────────────────────────────
+/// Transaction PDU tag: Unidirectional `[APPLICATION 1]` (0x61 constructed).
+pub const TAG_UNIDIRECTIONAL: u8 = 0x61;
+/// Transaction PDU tag: Begin `[APPLICATION 2]` (0x62 constructed).
+pub const TAG_BEGIN: u8 = 0x62;
+/// Transaction PDU tag: End `[APPLICATION 4]` (0x64 constructed).
+pub const TAG_END: u8 = 0x64;
+/// Transaction PDU tag: Continue `[APPLICATION 5]` (0x65 constructed).
+pub const TAG_CONTINUE: u8 = 0x65;
+/// Transaction PDU tag: Abort `[APPLICATION 7]` (0x67 constructed).
+pub const TAG_ABORT: u8 = 0x67;
+
+// ── Component types (Q.773 §3.2, CONTEXT class) ─────────────────────────────
+/// Component type: Invoke `[CONTEXT 1]`.
+pub const COMPONENT_INVOKE: u8 = 1;
+/// Component type: ReturnResult (Last) `[CONTEXT 2]`.
+pub const COMPONENT_RETURN_RESULT_LAST: u8 = 2;
+/// Component type: ReturnError `[CONTEXT 3]`.
+pub const COMPONENT_RETURN_ERROR: u8 = 3;
+/// Component type: Reject `[CONTEXT 4]`.
+pub const COMPONENT_REJECT: u8 = 4;
+/// Component type: ReturnResult (Not Last) `[CONTEXT 7]`.
+pub const COMPONENT_RETURN_RESULT_NOT_LAST: u8 = 7;
+
+// ── OperationCode helper ────────────────────────────────────────────────────
+/// A TCAP operation code — either a `local` integer or a `global` OID.
+///
+/// Construct with `OperationCode.local(int)` or `OperationCode.global_(oid_arcs)`.
+#[pyclass(name = "OperationCode", module = "tcap._tcap", from_py_object)]
+#[derive(Clone)]
+pub struct PyOperationCode {
+    inner: OperationCode,
+}
+
+#[pymethods]
+impl PyOperationCode {
+    /// A local (integer) operation code.
+    #[staticmethod]
+    fn local(value: i64) -> Self {
+        Self {
+            inner: OperationCode::Local(value),
+        }
+    }
+
+    /// A global (OID) operation code, from a sequence of arcs (e.g. `[0, 4, 0, 0, 1, 0, 21, 3]`).
+    #[staticmethod]
+    #[pyo3(name = "global_")]
+    fn global_(arcs: Vec<u32>) -> PyResult<Self> {
+        let oid = ObjectIdentifier::new(arcs)
+            .ok_or_else(|| TcapError::new_err("invalid object identifier arcs"))?;
+        Ok(Self {
+            inner: OperationCode::Global(oid),
+        })
+    }
+
+    /// `True` if this is a local (integer) code.
+    #[getter]
+    fn is_local(&self) -> bool {
+        matches!(self.inner, OperationCode::Local(_))
+    }
+
+    /// The local integer value, or `None` for a global code.
+    #[getter]
+    fn value(&self) -> Option<i64> {
+        match &self.inner {
+            OperationCode::Local(v) => Some(*v),
+            OperationCode::Global(_) => None,
+        }
+    }
+
+    /// The OID arcs, or `None` for a local code.
+    #[getter]
+    fn oid(&self) -> Option<Vec<u32>> {
+        match &self.inner {
+            OperationCode::Global(oid) => Some(oid.to_vec()),
+            OperationCode::Local(_) => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("OperationCode({})", self.inner)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+// ── ErrorCode helper ────────────────────────────────────────────────────────
+/// A TCAP error code — either a `local` integer or a `global` OID.
+#[pyclass(name = "ErrorCode", module = "tcap._tcap", from_py_object)]
+#[derive(Clone)]
+pub struct PyErrorCode {
+    inner: ErrorCode,
+}
+
+#[pymethods]
+impl PyErrorCode {
+    /// A local (integer) error code.
+    #[staticmethod]
+    fn local(value: i64) -> Self {
+        Self {
+            inner: ErrorCode::Local(value),
+        }
+    }
+
+    /// A global (OID) error code, from a sequence of arcs.
+    #[staticmethod]
+    #[pyo3(name = "global_")]
+    fn global_(arcs: Vec<u32>) -> PyResult<Self> {
+        let oid = ObjectIdentifier::new(arcs)
+            .ok_or_else(|| TcapError::new_err("invalid object identifier arcs"))?;
+        Ok(Self {
+            inner: ErrorCode::Global(oid),
+        })
+    }
+
+    /// `True` if this is a local (integer) code.
+    #[getter]
+    fn is_local(&self) -> bool {
+        matches!(self.inner, ErrorCode::Local(_))
+    }
+
+    /// The local integer value, or `None` for a global code.
+    #[getter]
+    fn value(&self) -> Option<i64> {
+        match &self.inner {
+            ErrorCode::Local(v) => Some(*v),
+            ErrorCode::Global(_) => None,
+        }
+    }
+
+    /// The OID arcs, or `None` for a local code.
+    #[getter]
+    fn oid(&self) -> Option<Vec<u32>> {
+        match &self.inner {
+            ErrorCode::Global(oid) => Some(oid.to_vec()),
+            ErrorCode::Local(_) => None,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ErrorCode({})", self.inner)
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.inner == other.inner
+    }
+}
+
+// ── Components ──────────────────────────────────────────────────────────────
+/// A TCAP Invoke component (Q.773 §3.2) — carries an operation for the peer.
+#[pyclass(name = "Invoke", module = "tcap._tcap", from_py_object)]
+#[derive(Clone)]
+pub struct PyInvoke {
+    #[pyo3(get, set)]
+    pub invoke_id: i64,
+    #[pyo3(get, set)]
+    pub linked_id: Option<i64>,
+    #[pyo3(get, set)]
+    pub operation_code: PyOperationCode,
+    /// Opaque operation argument (BER), decoded by the application (e.g. MAP).
+    parameter: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl PyInvoke {
+    #[new]
+    #[pyo3(signature = (invoke_id, operation_code, *, linked_id = None, parameter = None))]
+    fn new(
+        invoke_id: i64,
+        operation_code: PyOperationCode,
+        linked_id: Option<i64>,
+        parameter: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            invoke_id,
+            linked_id,
+            operation_code,
+            parameter,
+        }
+    }
+
+    /// The opaque operation argument as `bytes` (or `None`).
+    #[getter]
+    fn parameter<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.parameter.as_ref().map(|p| PyBytes::new(py, p))
+    }
+
+    #[setter]
+    fn set_parameter(&mut self, parameter: Option<Vec<u8>>) {
+        self.parameter = parameter;
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Invoke(invoke_id={}, operation_code={})",
+            self.invoke_id, self.operation_code.inner
+        )
+    }
+}
+
+impl PyInvoke {
+    fn to_core(&self) -> Invoke {
+        Invoke {
+            invoke_id: self.invoke_id,
+            linked_id: self.linked_id,
+            operation_code: self.operation_code.inner.clone(),
+            parameter: self.parameter.clone().map(Any::new),
+        }
+    }
+
+    fn from_core(inv: Invoke) -> Self {
+        Self {
+            invoke_id: inv.invoke_id,
+            linked_id: inv.linked_id,
+            operation_code: PyOperationCode {
+                inner: inv.operation_code,
+            },
+            parameter: inv.parameter.map(|a| a.as_bytes().to_vec()),
+        }
+    }
+}
+
+/// A TCAP ReturnResult component — the (successful) result of an Invoke.
+///
+/// `last=True` (the default) uses `[CONTEXT 2]` (ReturnResultLast); `last=False`
+/// uses `[CONTEXT 7]` (ReturnResultNotLast), for segmented results.
+#[pyclass(name = "ReturnResult", module = "tcap._tcap", from_py_object)]
+#[derive(Clone)]
+pub struct PyReturnResult {
+    #[pyo3(get, set)]
+    pub invoke_id: i64,
+    #[pyo3(get, set)]
+    pub last: bool,
+    #[pyo3(get, set)]
+    pub operation_code: Option<PyOperationCode>,
+    parameter: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl PyReturnResult {
+    #[new]
+    #[pyo3(signature = (invoke_id, *, operation_code = None, parameter = None, last = true))]
+    fn new(
+        invoke_id: i64,
+        operation_code: Option<PyOperationCode>,
+        parameter: Option<Vec<u8>>,
+        last: bool,
+    ) -> Self {
+        Self {
+            invoke_id,
+            last,
+            operation_code,
+            parameter,
+        }
+    }
+
+    /// The opaque result parameter as `bytes` (or `None`).
+    #[getter]
+    fn parameter<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.parameter.as_ref().map(|p| PyBytes::new(py, p))
+    }
+
+    #[setter]
+    fn set_parameter(&mut self, parameter: Option<Vec<u8>>) {
+        self.parameter = parameter;
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ReturnResult(invoke_id={}, last={})",
+            self.invoke_id, self.last
+        )
+    }
+}
+
+impl PyReturnResult {
+    fn to_core(&self) -> ReturnResult {
+        let result = self.operation_code.as_ref().map(|op| ReturnResultValue {
+            operation_code: op.inner.clone(),
+            parameter: self.parameter.clone().map(Any::new),
+        });
+        ReturnResult {
+            invoke_id: self.invoke_id,
+            result,
+        }
+    }
+
+    fn from_core(rr: ReturnResult, last: bool) -> Self {
+        let (operation_code, parameter) = match rr.result {
+            Some(v) => (
+                Some(PyOperationCode {
+                    inner: v.operation_code,
+                }),
+                v.parameter.map(|a| a.as_bytes().to_vec()),
+            ),
+            None => (None, None),
+        };
+        Self {
+            invoke_id: rr.invoke_id,
+            last,
+            operation_code,
+            parameter,
+        }
+    }
+}
+
+/// A TCAP ReturnError component — a (failure) response to an Invoke.
+#[pyclass(name = "ReturnError", module = "tcap._tcap", from_py_object)]
+#[derive(Clone)]
+pub struct PyReturnError {
+    #[pyo3(get, set)]
+    pub invoke_id: i64,
+    #[pyo3(get, set)]
+    pub error_code: PyErrorCode,
+    parameter: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl PyReturnError {
+    #[new]
+    #[pyo3(signature = (invoke_id, error_code, *, parameter = None))]
+    fn new(invoke_id: i64, error_code: PyErrorCode, parameter: Option<Vec<u8>>) -> Self {
+        Self {
+            invoke_id,
+            error_code,
+            parameter,
+        }
+    }
+
+    /// The opaque error parameter as `bytes` (or `None`).
+    #[getter]
+    fn parameter<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.parameter.as_ref().map(|p| PyBytes::new(py, p))
+    }
+
+    #[setter]
+    fn set_parameter(&mut self, parameter: Option<Vec<u8>>) {
+        self.parameter = parameter;
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ReturnError(invoke_id={}, error_code={})",
+            self.invoke_id, self.error_code.inner
+        )
+    }
+}
+
+impl PyReturnError {
+    fn to_core(&self) -> ReturnError {
+        ReturnError {
+            invoke_id: self.invoke_id,
+            error_code: self.error_code.inner.clone(),
+            parameter: self.parameter.clone().map(Any::new),
+        }
+    }
+
+    fn from_core(re: ReturnError) -> Self {
+        Self {
+            invoke_id: re.invoke_id,
+            error_code: PyErrorCode {
+                inner: re.error_code,
+            },
+            parameter: re.parameter.map(|a| a.as_bytes().to_vec()),
+        }
+    }
+}
+
+/// A TCAP Reject component — rejects a received component; `problem` is opaque BER.
+#[pyclass(name = "Reject", module = "tcap._tcap", from_py_object)]
+#[derive(Clone)]
+pub struct PyReject {
+    #[pyo3(get, set)]
+    pub invoke_id: i64,
+    problem: Vec<u8>,
+}
+
+#[pymethods]
+impl PyReject {
+    #[new]
+    fn new(invoke_id: i64, problem: Vec<u8>) -> Self {
+        Self { invoke_id, problem }
+    }
+
+    /// The opaque problem code as `bytes`.
+    #[getter]
+    fn problem<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.problem)
+    }
+
+    #[setter]
+    fn set_problem(&mut self, problem: Vec<u8>) {
+        self.problem = problem;
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Reject(invoke_id={})", self.invoke_id)
+    }
+}
+
+impl PyReject {
+    fn to_core(&self) -> Reject {
+        Reject {
+            invoke_id: self.invoke_id,
+            problem: Any::new(self.problem.clone()),
+        }
+    }
+
+    fn from_core(rj: Reject) -> Self {
+        Self {
+            invoke_id: rj.invoke_id,
+            problem: rj.problem.as_bytes().to_vec(),
+        }
+    }
+}
+
+// ── Component conversion (Python object → core Component) ────────────────────
+/// Convert a Python component object (Invoke / ReturnResult / ReturnError /
+/// Reject) into a core [`Component`], preserving Last vs NotLast for ReturnResult.
+fn py_component_to_core(py: Python<'_>, obj: &Py<PyAny>) -> PyResult<Component> {
+    let bound = obj.bind(py);
+    if let Ok(inv) = bound.extract::<PyInvoke>() {
+        Ok(Component::Invoke(inv.to_core()))
+    } else if let Ok(rr) = bound.extract::<PyReturnResult>() {
+        let core = rr.to_core();
+        Ok(if rr.last {
+            Component::ReturnResultLast(core)
+        } else {
+            Component::ReturnResultNotLast(core)
+        })
+    } else if let Ok(re) = bound.extract::<PyReturnError>() {
+        Ok(Component::ReturnError(re.to_core()))
+    } else if let Ok(rj) = bound.extract::<PyReject>() {
+        Ok(Component::Reject(rj.to_core()))
+    } else {
+        Err(TcapError::new_err(
+            "component must be an Invoke, ReturnResult, ReturnError, or Reject",
+        ))
+    }
+}
+
+/// Convert a core [`Component`] into the matching Python component object.
+fn core_component_to_py(py: Python<'_>, comp: Component) -> PyResult<Py<PyAny>> {
+    let any = match comp {
+        Component::Invoke(inv) => Bound::new(py, PyInvoke::from_core(inv))?.into_any(),
+        Component::ReturnResultLast(rr) => {
+            Bound::new(py, PyReturnResult::from_core(rr, true))?.into_any()
+        }
+        Component::ReturnResultNotLast(rr) => {
+            Bound::new(py, PyReturnResult::from_core(rr, false))?.into_any()
+        }
+        Component::ReturnError(re) => Bound::new(py, PyReturnError::from_core(re))?.into_any(),
+        Component::Reject(rj) => Bound::new(py, PyReject::from_core(rj))?.into_any(),
+    };
+    Ok(any.unbind())
+}
+
+fn components_to_core(py: Python<'_>, comps: &[Py<PyAny>]) -> PyResult<Vec<Component>> {
+    comps.iter().map(|c| py_component_to_core(py, c)).collect()
+}
+
+fn components_to_py(py: Python<'_>, comps: Vec<Component>) -> PyResult<Vec<Py<PyAny>>> {
+    comps
+        .into_iter()
+        .map(|c| core_component_to_py(py, c))
+        .collect()
+}
+
+// ── Transaction messages ────────────────────────────────────────────────────
+/// A TCAP **Begin** transaction (`[APPLICATION 2]`) — opens a dialogue.
+#[pyclass(name = "Begin", module = "tcap._tcap", skip_from_py_object)]
+pub struct PyBegin {
+    otid: Vec<u8>,
+    dialogue_portion: Option<Vec<u8>>,
+    components: Vec<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyBegin {
+    #[new]
+    #[pyo3(signature = (otid, *, components = None, dialogue_portion = None))]
+    fn new(
+        otid: Vec<u8>,
+        components: Option<Vec<Py<PyAny>>>,
+        dialogue_portion: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            otid,
+            dialogue_portion,
+            components: components.unwrap_or_default(),
+        }
+    }
+
+    /// Originating Transaction ID (`bytes`, 1–4 octets).
+    #[getter]
+    fn otid<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.otid)
+    }
+
+    /// The dialogue portion (opaque EXTERNAL BER) as `bytes`, or `None`.
+    #[getter]
+    fn dialogue_portion<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.dialogue_portion.as_ref().map(|d| PyBytes::new(py, d))
+    }
+
+    /// The component list (Invoke / ReturnResult / … objects).
+    #[getter]
+    fn components(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        self.components.iter().map(|c| c.clone_ref(py)).collect()
+    }
+
+    /// Encode this Begin to Q.773-compliant BER `bytes`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let components = components_to_core(py, &self.components)?;
+        let begin = Begin {
+            otid: OctetString::from(self.otid.clone()),
+            dialogue_portion: self.dialogue_portion.clone().map(|d| DialoguePortion {
+                external: Any::new(d),
+            }),
+            components: if components.is_empty() {
+                None
+            } else {
+                Some(components)
+            },
+        };
+        let bytes = crate::encode(&TcapMessage::Begin(begin)).map_err(tcap_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Begin(otid={}, {} components)",
+            hex::encode(&self.otid),
+            self.components.len()
+        )
+    }
+}
+
+/// A TCAP **Continue** transaction (`[APPLICATION 5]`) — mid-dialogue exchange.
+#[pyclass(name = "Continue", module = "tcap._tcap", skip_from_py_object)]
+pub struct PyContinue {
+    otid: Vec<u8>,
+    dtid: Vec<u8>,
+    dialogue_portion: Option<Vec<u8>>,
+    components: Vec<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyContinue {
+    #[new]
+    #[pyo3(signature = (otid, dtid, *, components = None, dialogue_portion = None))]
+    fn new(
+        otid: Vec<u8>,
+        dtid: Vec<u8>,
+        components: Option<Vec<Py<PyAny>>>,
+        dialogue_portion: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            otid,
+            dtid,
+            dialogue_portion,
+            components: components.unwrap_or_default(),
+        }
+    }
+
+    /// Originating Transaction ID (`bytes`).
+    #[getter]
+    fn otid<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.otid)
+    }
+
+    /// Destination Transaction ID (`bytes`).
+    #[getter]
+    fn dtid<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.dtid)
+    }
+
+    /// The dialogue portion (opaque EXTERNAL BER) as `bytes`, or `None`.
+    #[getter]
+    fn dialogue_portion<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.dialogue_portion.as_ref().map(|d| PyBytes::new(py, d))
+    }
+
+    /// The component list.
+    #[getter]
+    fn components(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        self.components.iter().map(|c| c.clone_ref(py)).collect()
+    }
+
+    /// Encode this Continue to Q.773-compliant BER `bytes`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let components = components_to_core(py, &self.components)?;
+        let cont = Continue {
+            otid: OctetString::from(self.otid.clone()),
+            dtid: OctetString::from(self.dtid.clone()),
+            dialogue_portion: self.dialogue_portion.clone().map(|d| DialoguePortion {
+                external: Any::new(d),
+            }),
+            components: if components.is_empty() {
+                None
+            } else {
+                Some(components)
+            },
+        };
+        let bytes = crate::encode(&TcapMessage::Continue(cont)).map_err(tcap_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Continue(otid={}, dtid={}, {} components)",
+            hex::encode(&self.otid),
+            hex::encode(&self.dtid),
+            self.components.len()
+        )
+    }
+}
+
+/// A TCAP **End** transaction (`[APPLICATION 4]`) — closes a dialogue.
+#[pyclass(name = "End", module = "tcap._tcap", skip_from_py_object)]
+pub struct PyEnd {
+    dtid: Vec<u8>,
+    dialogue_portion: Option<Vec<u8>>,
+    components: Vec<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyEnd {
+    #[new]
+    #[pyo3(signature = (dtid, *, components = None, dialogue_portion = None))]
+    fn new(
+        dtid: Vec<u8>,
+        components: Option<Vec<Py<PyAny>>>,
+        dialogue_portion: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            dtid,
+            dialogue_portion,
+            components: components.unwrap_or_default(),
+        }
+    }
+
+    /// Destination Transaction ID (`bytes`).
+    #[getter]
+    fn dtid<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.dtid)
+    }
+
+    /// The dialogue portion (opaque EXTERNAL BER) as `bytes`, or `None`.
+    #[getter]
+    fn dialogue_portion<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.dialogue_portion.as_ref().map(|d| PyBytes::new(py, d))
+    }
+
+    /// The component list.
+    #[getter]
+    fn components(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        self.components.iter().map(|c| c.clone_ref(py)).collect()
+    }
+
+    /// Encode this End to Q.773-compliant BER `bytes`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let components = components_to_core(py, &self.components)?;
+        let end = End {
+            dtid: OctetString::from(self.dtid.clone()),
+            dialogue_portion: self.dialogue_portion.clone().map(|d| DialoguePortion {
+                external: Any::new(d),
+            }),
+            components: if components.is_empty() {
+                None
+            } else {
+                Some(components)
+            },
+        };
+        let bytes = crate::encode(&TcapMessage::End(end)).map_err(tcap_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "End(dtid={}, {} components)",
+            hex::encode(&self.dtid),
+            self.components.len()
+        )
+    }
+}
+
+/// A TCAP **Abort** transaction (`[APPLICATION 7]`) — aborts a dialogue.
+#[pyclass(name = "Abort", module = "tcap._tcap", skip_from_py_object)]
+pub struct PyAbort {
+    dtid: Vec<u8>,
+    reason: Option<Vec<u8>>,
+}
+
+#[pymethods]
+impl PyAbort {
+    #[new]
+    #[pyo3(signature = (dtid, *, reason = None))]
+    fn new(dtid: Vec<u8>, reason: Option<Vec<u8>>) -> Self {
+        Self { dtid, reason }
+    }
+
+    /// Destination Transaction ID (`bytes`).
+    #[getter]
+    fn dtid<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.dtid)
+    }
+
+    /// The abort reason (opaque P-Abort cause / dialogue ABRT BER), or `None`.
+    #[getter]
+    fn reason<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.reason.as_ref().map(|r| PyBytes::new(py, r))
+    }
+
+    /// Encode this Abort to Q.773-compliant BER `bytes`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let abort = Abort {
+            dtid: OctetString::from(self.dtid.clone()),
+            reason: self.reason.clone().map(Any::new),
+        };
+        let bytes = crate::encode(&TcapMessage::Abort(abort)).map_err(tcap_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Abort(dtid={})", hex::encode(&self.dtid))
+    }
+}
+
+/// A TCAP **Unidirectional** transaction (`[APPLICATION 1]`) — fire-and-forget.
+#[pyclass(name = "Unidirectional", module = "tcap._tcap", skip_from_py_object)]
+pub struct PyUnidirectional {
+    dialogue_portion: Option<Vec<u8>>,
+    components: Vec<Py<PyAny>>,
+}
+
+#[pymethods]
+impl PyUnidirectional {
+    #[new]
+    #[pyo3(signature = (*, components = None, dialogue_portion = None))]
+    fn new(components: Option<Vec<Py<PyAny>>>, dialogue_portion: Option<Vec<u8>>) -> Self {
+        Self {
+            dialogue_portion,
+            components: components.unwrap_or_default(),
+        }
+    }
+
+    /// The dialogue portion (opaque EXTERNAL BER) as `bytes`, or `None`.
+    #[getter]
+    fn dialogue_portion<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.dialogue_portion.as_ref().map(|d| PyBytes::new(py, d))
+    }
+
+    /// The component list.
+    #[getter]
+    fn components(&self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        self.components.iter().map(|c| c.clone_ref(py)).collect()
+    }
+
+    /// Encode this Unidirectional to Q.773-compliant BER `bytes`.
+    fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let components = components_to_core(py, &self.components)?;
+        let uni = Unidirectional {
+            dialogue_portion: self.dialogue_portion.clone().map(|d| DialoguePortion {
+                external: Any::new(d),
+            }),
+            components,
+        };
+        let bytes = crate::encode(&TcapMessage::Unidirectional(uni)).map_err(tcap_err)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Unidirectional({} components)", self.components.len())
+    }
+}
+
+// ── encode() / decode() ─────────────────────────────────────────────────────
+/// Encode any TCAP message object (Begin / Continue / End / Abort /
+/// Unidirectional) to BER `bytes`. Equivalent to calling `msg.encode()`.
+#[pyfunction]
+fn encode<'py>(py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyBytes>> {
+    if let Ok(m) = message.cast::<PyBegin>() {
+        m.borrow().encode(py)
+    } else if let Ok(m) = message.cast::<PyContinue>() {
+        m.borrow().encode(py)
+    } else if let Ok(m) = message.cast::<PyEnd>() {
+        m.borrow().encode(py)
+    } else if let Ok(m) = message.cast::<PyAbort>() {
+        m.borrow().encode(py)
+    } else if let Ok(m) = message.cast::<PyUnidirectional>() {
+        m.borrow().encode(py)
+    } else {
+        Err(TcapError::new_err(
+            "message must be a Begin, Continue, End, Abort, or Unidirectional",
+        ))
+    }
+}
+
+/// Decode a TCAP message from BER `bytes`, returning the matching message class
+/// (`Begin`, `Continue`, `End`, `Abort`, or `Unidirectional`).
+#[pyfunction]
+fn decode(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyAny>> {
+    let msg = crate::decode(data).map_err(tcap_err)?;
+    let any = match msg {
+        TcapMessage::Begin(b) => {
+            let components = components_to_py(py, b.components.unwrap_or_default())?;
+            Bound::new(
+                py,
+                PyBegin {
+                    otid: b.otid.to_vec(),
+                    dialogue_portion: b.dialogue_portion.map(|d| d.external.as_bytes().to_vec()),
+                    components,
+                },
+            )?
+            .into_any()
+        }
+        TcapMessage::Continue(c) => {
+            let components = components_to_py(py, c.components.unwrap_or_default())?;
+            Bound::new(
+                py,
+                PyContinue {
+                    otid: c.otid.to_vec(),
+                    dtid: c.dtid.to_vec(),
+                    dialogue_portion: c.dialogue_portion.map(|d| d.external.as_bytes().to_vec()),
+                    components,
+                },
+            )?
+            .into_any()
+        }
+        TcapMessage::End(e) => {
+            let components = components_to_py(py, e.components.unwrap_or_default())?;
+            Bound::new(
+                py,
+                PyEnd {
+                    dtid: e.dtid.to_vec(),
+                    dialogue_portion: e.dialogue_portion.map(|d| d.external.as_bytes().to_vec()),
+                    components,
+                },
+            )?
+            .into_any()
+        }
+        TcapMessage::Abort(a) => Bound::new(
+            py,
+            PyAbort {
+                dtid: a.dtid.to_vec(),
+                reason: a.reason.map(|r| r.as_bytes().to_vec()),
+            },
+        )?
+        .into_any(),
+        TcapMessage::Unidirectional(u) => {
+            let components = components_to_py(py, u.components)?;
+            Bound::new(
+                py,
+                PyUnidirectional {
+                    dialogue_portion: u.dialogue_portion.map(|d| d.external.as_bytes().to_vec()),
+                    components,
+                },
+            )?
+            .into_any()
+        }
+    };
+    Ok(any.unbind())
+}
+
+// ── Module wiring ───────────────────────────────────────────────────────────
+fn add_contents(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("TcapError", m.py().get_type::<TcapError>())?;
+
+    // Operation / error code helpers.
+    m.add_class::<PyOperationCode>()?;
+    m.add_class::<PyErrorCode>()?;
+
+    // Components.
+    m.add_class::<PyInvoke>()?;
+    m.add_class::<PyReturnResult>()?;
+    m.add_class::<PyReturnError>()?;
+    m.add_class::<PyReject>()?;
+
+    // Transaction messages.
+    m.add_class::<PyBegin>()?;
+    m.add_class::<PyContinue>()?;
+    m.add_class::<PyEnd>()?;
+    m.add_class::<PyAbort>()?;
+    m.add_class::<PyUnidirectional>()?;
+
+    // Codec.
+    m.add_function(wrap_pyfunction!(encode, m)?)?;
+    m.add_function(wrap_pyfunction!(decode, m)?)?;
+
+    // Q.773 transaction PDU tags (the first BER byte of an encoded message).
+    m.add("TAG_UNIDIRECTIONAL", TAG_UNIDIRECTIONAL)?;
+    m.add("TAG_BEGIN", TAG_BEGIN)?;
+    m.add("TAG_END", TAG_END)?;
+    m.add("TAG_CONTINUE", TAG_CONTINUE)?;
+    m.add("TAG_ABORT", TAG_ABORT)?;
+
+    // Component type numbers (Q.773 §3.2, CONTEXT class).
+    m.add("COMPONENT_INVOKE", COMPONENT_INVOKE)?;
+    m.add("COMPONENT_RETURN_RESULT_LAST", COMPONENT_RETURN_RESULT_LAST)?;
+    m.add("COMPONENT_RETURN_ERROR", COMPONENT_RETURN_ERROR)?;
+    m.add("COMPONENT_REJECT", COMPONENT_REJECT)?;
+    m.add(
+        "COMPONENT_RETURN_RESULT_NOT_LAST",
+        COMPONENT_RETURN_RESULT_NOT_LAST,
+    )?;
+
+    Ok(())
+}
+
+/// Standalone wheel entry point (maturin `module-name = "tcap._tcap"`).
+#[pymodule]
+fn _tcap(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    add_contents(m)
+}
+
+/// Embedding entry point: build a `tcap` submodule and attach it to `parent`,
+/// so a host extension can expose tcap without a second shared object.
+pub fn register(py: Python<'_>, parent: &Bound<'_, PyModule>) -> PyResult<()> {
+    let m = PyModule::new(py, "tcap")?;
+    add_contents(&m)?;
+    parent.setattr("tcap", &m)?;
+    Ok(())
+}

@@ -1,0 +1,44 @@
+# Maturin build config for the tcap wheel. The version is single-sourced from
+# Cargo.toml (`dynamic = ["version"]`), so PyPI and crates.io always ship the same
+# number. `extension-module` is the ONLY place that feature is enabled — never by
+# `cargo test`/`cargo clippy` (it un-links libpython and breaks Rust test binaries).
+#
+# NOTE ON NAMES: the crates.io crate is `tcap`, but `tcap` is TAKEN on PyPI, so the
+# PyPI distribution is published as `ss7-tcap`. The import name stays `tcap`
+# (module-name = "tcap._tcap" + python-source = "python"), so users:
+#     pip install ss7-tcap
+#     python -c "import tcap"
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ss7-tcap"
+description = "Rust-backed TCAP (ITU-T Q.771–Q.775) BER codec for Python — transactions, dialogue, and components"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Real Time Telecom B.V." }]
+keywords = ["tcap", "ss7", "sigtran", "asn1", "telecom"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Telecommunications Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
+    "Topic :: Communications",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/Real-Time-Telecom-B-V/tcap"
+Repository = "https://github.com/Real-Time-Telecom-B-V/tcap"
+
+[tool.maturin]
+# Mixed layout: compiled ext at `tcap._tcap`, pure-Python shim under python/.
+# The PyPI distribution name is `ss7-tcap` (set in [project]); the import name is
+# `tcap`.
+module-name = "tcap._tcap"
+python-source = "python"
+features = ["extension-module"]

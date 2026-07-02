@@ -26,5 +26,18 @@ ITU-T Q.771–Q.775.
 - `Display` for `TcapMessage`, `Component`, `OperationCode`, and `ErrorCode`.
 - Tests covering round-trip encode/decode of every transaction and component
   type, the Q.773 tag assignments, and error/display paths.
+- **Python bindings** (`pip install ss7-tcap`, imported as `tcap`; feature
+  `python`) — the transaction messages (`Begin`, `Continue`, `End`, `Abort`,
+  `Unidirectional`), the components (`Invoke`, `ReturnResult`, `ReturnError`,
+  `Reject`), `OperationCode` / `ErrorCode`, `encode()` / `decode()`, and the
+  Q.773 tag / component-type constants. Opaque fields are `bytes`. Declared
+  `gil_used = false` for free-threaded CPython. A `register(py, parent)` entry
+  point mounts `tcap` as a submodule of a host extension. (The crates.io crate
+  stays `tcap`; only the PyPI distribution is `ss7-tcap`, as `tcap` is taken.)
+- **Quality bar** — criterion benches (`benches/codec.rs`: Begin-with-Invoke and
+  End-with-ReturnResult encode/decode), a counting-allocator leak check
+  (`examples/leak_check.rs` + `scripts/mem_leak_test.sh`), pytest parity tests,
+  and CI (fmt / clippy both faces / test both faces / bench-compile / leak gate /
+  wheel + pytest on 3.9 & 3.13 + free-threaded).
 
 [1.0.0]: https://github.com/Real-Time-Telecom-B-V/tcap/releases/tag/v1.0.0
