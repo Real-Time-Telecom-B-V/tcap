@@ -23,10 +23,18 @@ pub enum Component {
 impl fmt::Display for Component {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Invoke(inv) => write!(f, "Invoke [id={}, op={}]", inv.invoke_id, inv.operation_code),
+            Self::Invoke(inv) => write!(
+                f,
+                "Invoke [id={}, op={}]",
+                inv.invoke_id, inv.operation_code
+            ),
             Self::ReturnResultLast(rr) => write!(f, "ReturnResultLast [id={}]", rr.invoke_id),
             Self::ReturnResultNotLast(rr) => write!(f, "ReturnResultNotLast [id={}]", rr.invoke_id),
-            Self::ReturnError(re) => write!(f, "ReturnError [id={}, err={}]", re.invoke_id, re.error_code),
+            Self::ReturnError(re) => write!(
+                f,
+                "ReturnError [id={}, err={}]",
+                re.invoke_id, re.error_code
+            ),
             Self::Reject(rj) => write!(f, "Reject [id={}]", rj.invoke_id),
         }
     }

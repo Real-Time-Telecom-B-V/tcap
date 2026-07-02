@@ -1,12 +1,24 @@
 [package]
 name = "tcap"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "TCAP (Transaction Capabilities Application Part) codec per ITU-T Q.771-Q.775"
+rust-version = "1.80"
+description = "Pure-Rust TCAP (Transaction Capabilities Application Part) codec per ITU-T Q.771-Q.775 — transactions, dialogue, and components over BER"
+authors = ["Real Time Telecom B.V."]
 license = "MIT"
-repository = "https://github.com/killdashnine/tcap"
+readme = "README.md"
+repository = "https://github.com/Real-Time-Telecom-B-V/tcap"
+homepage = "https://github.com/Real-Time-Telecom-B-V/tcap"
+keywords = ["tcap", "ss7", "sigtran", "asn1", "telecom"]
+categories = ["network-programming", "encoding"]
+exclude = [".github/", "docs/"]
 
 [dependencies]
+# ASN.1 BER encode/decode — TCAP messages are BER (X.690) with APPLICATION/CONTEXT tags.
 rasn = "0.28"
+# hex is used for the Display impls (rendering transaction IDs).
 hex = "0.4"
 thiserror = "2"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }

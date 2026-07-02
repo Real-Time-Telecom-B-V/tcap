@@ -1,0 +1,38 @@
+# .github/workflows/ci.yml — tcap CI
+#
+# tcap is a pure-Rust library (a TCAP codec: transactions, dialogue, and
+# components over BER, per ITU-T Q.771-Q.775). No Python, no wheels — a single
+# Rust job runs format, clippy, and tests.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      # Clippy honours [lints.clippy] in Cargo.toml (correctness denied).
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test

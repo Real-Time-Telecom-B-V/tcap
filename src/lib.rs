@@ -16,8 +16,8 @@
 //! let invoke = Invoke {
 //!     invoke_id: 1,
 //!     linked_id: None,
-//!     operation_code: OperationCode::Local(45), // sendRoutingInfoForSM
-//!     parameter: None,
+//!     operation_code: OperationCode::Local(45), // an application-defined operation
+//!     parameter: None,                          // MAP/CAP/INAP argument goes here
 //! };
 //!
 //! let begin = Begin {
