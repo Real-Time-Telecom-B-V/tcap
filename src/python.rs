@@ -24,6 +24,7 @@ use pyo3::types::{PyBytes, PyModule};
 
 use rasn::types::{Any, ObjectIdentifier, OctetString};
 
+use crate::dialogue::{AbortSource, AssociateSourceDiagnostic, DialoguePdu as CoreDialoguePdu};
 use crate::{
     Abort, Begin, Component, Continue, DialoguePortion, End, ErrorCode, Invoke, OperationCode,
     Reject, ReturnError, ReturnResult, ReturnResultValue, TcapError as CoreTcapError, TcapMessage,
@@ -821,6 +822,175 @@ impl PyUnidirectional {
     }
 }
 
+// ── Dialogue portion (AARQ / AARE / ABRT) ───────────────────────────────────
+/// ABRT-source: dialogue-service-user(0).
+pub const ABORT_SOURCE_USER: i64 = 0;
+/// ABRT-source: dialogue-service-provider(1).
+pub const ABORT_SOURCE_PROVIDER: i64 = 1;
+
+fn oid_from_arcs(arcs: Vec<u32>) -> PyResult<ObjectIdentifier> {
+    ObjectIdentifier::new(arcs).ok_or_else(|| TcapError::new_err("invalid object identifier arcs"))
+}
+
+/// A decoded TCAP dialogue PDU (AARQ / AARE / ABRT), as read back from a
+/// message's `dialogue_portion` by [`parse_dialogue_portion`].
+///
+/// Inspect `.pdu_type` (`"AARQ"` / `"AARE"` / `"ABRT"`); AARQ/AARE expose
+/// `.application_context` (OID arcs) and AARE also `.result` (0 = accepted) and
+/// `.result_source_diagnostic` (a `(source, value)` pair, source 1 = user,
+/// 2 = provider); ABRT exposes `.abort_source` (0 = user, 1 = provider).
+#[pyclass(name = "DialoguePdu", module = "tcap._tcap", skip_from_py_object)]
+pub struct PyDialoguePdu {
+    inner: CoreDialoguePdu,
+}
+
+#[pymethods]
+impl PyDialoguePdu {
+    /// `"AARQ"`, `"AARE"`, or `"ABRT"`.
+    #[getter]
+    fn pdu_type(&self) -> &'static str {
+        match &self.inner {
+            CoreDialoguePdu::Aarq { .. } => "AARQ",
+            CoreDialoguePdu::Aare { .. } => "AARE",
+            CoreDialoguePdu::Abrt { .. } => "ABRT",
+        }
+    }
+
+    /// The application-context-name OID arcs (AARQ / AARE), else `None`.
+    #[getter]
+    fn application_context(&self) -> Option<Vec<u32>> {
+        match &self.inner {
+            CoreDialoguePdu::Aarq {
+                application_context_name,
+                ..
+            }
+            | CoreDialoguePdu::Aare {
+                application_context_name,
+                ..
+            } => Some(application_context_name.to_vec()),
+            CoreDialoguePdu::Abrt { .. } => None,
+        }
+    }
+
+    /// The associate result INTEGER (AARE only): 0 accepted, 1 reject-permanent,
+    /// 2 reject-transient. `None` for AARQ / ABRT.
+    #[getter]
+    fn result(&self) -> Option<i64> {
+        match &self.inner {
+            CoreDialoguePdu::Aare { result, .. } => Some(result.value()),
+            _ => None,
+        }
+    }
+
+    /// The result-source-diagnostic (AARE only) as `(source, value)` where
+    /// source is 1 = dialogue-service-user, 2 = dialogue-service-provider.
+    #[getter]
+    fn result_source_diagnostic(&self) -> Option<(i64, i64)> {
+        match &self.inner {
+            CoreDialoguePdu::Aare {
+                result_source_diagnostic,
+                ..
+            } => Some(match result_source_diagnostic {
+                AssociateSourceDiagnostic::DialogueServiceUser(v) => (1, *v),
+                AssociateSourceDiagnostic::DialogueServiceProvider(v) => (2, *v),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The abort source INTEGER (ABRT only): 0 = user, 1 = provider.
+    #[getter]
+    fn abort_source(&self) -> Option<i64> {
+        match &self.inner {
+            CoreDialoguePdu::Abrt { abort_source, .. } => Some(abort_source.value()),
+            _ => None,
+        }
+    }
+
+    /// The opaque user-information `[30]` content octets, if present.
+    #[getter]
+    fn user_information<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        let ui = match &self.inner {
+            CoreDialoguePdu::Aarq {
+                user_information, ..
+            }
+            | CoreDialoguePdu::Aare {
+                user_information, ..
+            }
+            | CoreDialoguePdu::Abrt {
+                user_information, ..
+            } => user_information.as_ref(),
+        };
+        ui.map(|b| PyBytes::new(py, b))
+    }
+
+    fn __repr__(&self) -> String {
+        format!("DialoguePdu({})", self.pdu_type())
+    }
+}
+
+/// Build an **AARQ** dialogue portion carrying `application_context` (OID arcs),
+/// returning the `EXTERNAL` `bytes` to pass as a message's `dialogue_portion`.
+#[pyfunction]
+fn dialogue_aarq<'py>(
+    py: Python<'py>,
+    application_context: Vec<u32>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let oid = oid_from_arcs(application_context)?;
+    let dp = DialoguePortion::aarq(&oid);
+    Ok(PyBytes::new(py, dp.external.as_bytes()))
+}
+
+/// Build an accepting **AARE** dialogue portion (result accepted(0),
+/// diagnostic dialogue-service-user null(0)) carrying `application_context`
+/// (OID arcs), returning the `EXTERNAL` `bytes`.
+#[pyfunction]
+fn dialogue_aare_accept<'py>(
+    py: Python<'py>,
+    application_context: Vec<u32>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let oid = oid_from_arcs(application_context)?;
+    let dp = DialoguePortion::aare_accept(&oid);
+    Ok(PyBytes::new(py, dp.external.as_bytes()))
+}
+
+/// Build an **ABRT** dialogue portion for `abort_source` (0 = user,
+/// 1 = provider; see `ABORT_SOURCE_*`), returning the `EXTERNAL` `bytes`.
+#[pyfunction]
+fn dialogue_abrt<'py>(py: Python<'py>, abort_source: i64) -> PyResult<Bound<'py, PyBytes>> {
+    let source = match abort_source {
+        0 => AbortSource::DialogueServiceUser,
+        1 => AbortSource::DialogueServiceProvider,
+        _ => {
+            return Err(TcapError::new_err(
+                "abort_source must be 0 (user) or 1 (provider)",
+            ))
+        }
+    };
+    Ok(PyBytes::new(
+        py,
+        DialoguePortion::abrt(source).external.as_bytes(),
+    ))
+}
+
+/// Parse a dialogue portion (the `EXTERNAL` `bytes` from a decoded message's
+/// `dialogue_portion`) into a `DialoguePdu`, or `None` if it is not a
+/// well-formed AARQ / AARE / ABRT.
+#[pyfunction]
+fn parse_dialogue_portion(py: Python<'_>, data: &[u8]) -> PyResult<Option<Py<PyAny>>> {
+    let dp = DialoguePortion {
+        external: Any::new(data.to_vec()),
+    };
+    match dp.dialogue_pdu() {
+        Some(pdu) => Ok(Some(
+            Bound::new(py, PyDialoguePdu { inner: pdu })?
+                .into_any()
+                .unbind(),
+        )),
+        None => Ok(None),
+    }
+}
+
 // ── encode() / decode() ─────────────────────────────────────────────────────
 /// Encode any TCAP message object (Begin / Continue / End / Abort /
 /// Unidirectional) to BER `bytes`. Equivalent to calling `msg.encode()`.
@@ -929,6 +1099,15 @@ fn add_contents(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEnd>()?;
     m.add_class::<PyAbort>()?;
     m.add_class::<PyUnidirectional>()?;
+
+    // Dialogue portion (AARQ / AARE / ABRT).
+    m.add_class::<PyDialoguePdu>()?;
+    m.add_function(wrap_pyfunction!(dialogue_aarq, m)?)?;
+    m.add_function(wrap_pyfunction!(dialogue_aare_accept, m)?)?;
+    m.add_function(wrap_pyfunction!(dialogue_abrt, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_dialogue_portion, m)?)?;
+    m.add("ABORT_SOURCE_USER", ABORT_SOURCE_USER)?;
+    m.add("ABORT_SOURCE_PROVIDER", ABORT_SOURCE_PROVIDER)?;
 
     // Codec.
     m.add_function(wrap_pyfunction!(encode, m)?)?;

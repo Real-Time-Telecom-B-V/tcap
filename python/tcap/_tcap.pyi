@@ -25,6 +25,10 @@ COMPONENT_RETURN_ERROR: int
 COMPONENT_REJECT: int
 COMPONENT_RETURN_RESULT_NOT_LAST: int
 
+# ── ABRT-source values (X.880) ────────────────────────────────────────────────
+ABORT_SOURCE_USER: int
+ABORT_SOURCE_PROVIDER: int
+
 class TcapError(Exception):
     """TCAP protocol / codec error (ITU-T Q.771–Q.775)."""
 
@@ -197,3 +201,42 @@ def encode(message: Message) -> bytes:
 
 def decode(data: bytes) -> Message:
     """Decode a TCAP message from BER bytes into the matching message class."""
+
+# ── Dialogue portion (AARQ / AARE / ABRT) ─────────────────────────────────────
+class DialoguePdu:
+    """A decoded dialogue PDU read back from a message's ``dialogue_portion``.
+
+    Inspect ``pdu_type`` (``"AARQ"`` / ``"AARE"`` / ``"ABRT"``); AARQ/AARE expose
+    ``application_context`` (OID arcs) and AARE also ``result`` and
+    ``result_source_diagnostic``; ABRT exposes ``abort_source``.
+    """
+
+    @property
+    def pdu_type(self) -> str: ...
+    @property
+    def application_context(self) -> list[int] | None:
+        """The application-context-name OID arcs (AARQ / AARE), else ``None``."""
+    @property
+    def result(self) -> int | None:
+        """AARE associate result: 0 accepted, 1 reject-permanent, 2 reject-transient."""
+    @property
+    def result_source_diagnostic(self) -> tuple[int, int] | None:
+        """AARE ``(source, value)``; source 1 = user, 2 = provider."""
+    @property
+    def abort_source(self) -> int | None:
+        """ABRT source: 0 = user, 1 = provider."""
+    @property
+    def user_information(self) -> bytes | None:
+        """The opaque user-information ``[30]`` content octets, if present."""
+
+def dialogue_aarq(application_context: Sequence[int]) -> bytes:
+    """Build an AARQ dialogue portion (``EXTERNAL`` bytes) for the given OID arcs."""
+
+def dialogue_aare_accept(application_context: Sequence[int]) -> bytes:
+    """Build an accepting AARE dialogue portion (``EXTERNAL`` bytes) for the OID arcs."""
+
+def dialogue_abrt(abort_source: int) -> bytes:
+    """Build an ABRT dialogue portion for ``abort_source`` (0 = user, 1 = provider)."""
+
+def parse_dialogue_portion(data: bytes) -> DialoguePdu | None:
+    """Parse a dialogue portion's ``EXTERNAL`` bytes into a ``DialoguePdu``, or ``None``."""

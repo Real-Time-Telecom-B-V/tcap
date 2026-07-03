@@ -49,7 +49,7 @@ assert!(matches!(msg, TcapMessage::Begin(_)));
 |---|---|
 | **Transaction** (Q.773) | `TcapMessage` — `Unidirectional` · `Begin` · `End` · `Continue` · `Abort`, each with its APPLICATION-class tag and OTID/DTID transaction identifiers. |
 | **Component** (Q.773 §3.2) | `Component` — `Invoke` · `ReturnResultLast` · `ReturnResultNotLast` · `ReturnError` · `Reject`, with `OperationCode` / `ErrorCode` (local or global OID) and opaque parameters. |
-| **Dialogue** (Q.773) | `DialoguePortion` — carries the `EXTERNAL` dialogue PDU (AARQ/AARE/ABRT) for application-context negotiation. |
+| **Dialogue** (Q.773 / X.880) | `DialoguePortion` — the `EXTERNAL`-wrapped dialogue PDU (`DialoguePdu`: `Aarq` / `Aare` / `Abrt`) for application-context negotiation. Typed builders (`aarq`, `aare_accept`, `abrt`, `from_pdu`) produce byte-exact wire output; `dialogue_pdu()` parses a received portion back. |
 
 The API is two free functions plus the types:
 
@@ -58,10 +58,48 @@ pub fn encode(msg: &TcapMessage) -> Result<Vec<u8>, TcapError>;
 pub fn decode(bytes: &[u8]) -> Result<TcapMessage, TcapError>;
 ```
 
-Component parameters (the MAP/CAP/INAP argument, the dialogue `EXTERNAL`, a
-`Reject` problem) are kept as opaque `Any` bytes — TCAP delimits and routes them;
-the application layer above decodes them. That keeps this crate a focused
-transaction/component codec rather than a full MAP stack.
+Component parameters (the MAP/CAP/INAP argument, a `Reject` problem) are kept as
+opaque `Any` bytes — TCAP delimits and routes them; the application layer above
+decodes them. That keeps this crate a focused transaction/component codec rather
+than a full MAP stack.
+
+### Dialogue portion
+
+The dialogue portion carries the ACSE-style AARQ / AARE / ABRT PDUs that negotiate
+the **application context** (the MAP/CAP operation set). Build one with a typed
+builder and hand it straight to a transaction; parse a received one back to read
+the context and result:
+
+```rust
+use rasn::types::Oid;
+use tcap::{Begin, DialoguePortion, DialoguePdu, TcapMessage};
+
+// MAP shortMsgGateway v3 — the SRI-SM application context.
+let ac = Oid::new(&[0, 4, 0, 0, 1, 0, 20, 3]).unwrap();
+
+let begin = Begin {
+    otid: vec![0, 0, 0, 1].into(),
+    dialogue_portion: Some(DialoguePortion::aarq(ac)), // typed AARQ, byte-exact wire
+    components: None,
+};
+let wire = tcap::encode(&TcapMessage::Begin(begin)).unwrap();
+
+// On the receiving side, read the negotiated context back out.
+if let TcapMessage::Begin(b) = tcap::decode(&wire).unwrap() {
+    let dp = b.dialogue_portion.unwrap();
+    match dp.dialogue_pdu().unwrap() {
+        DialoguePdu::Aarq { application_context_name, .. } => {
+            assert_eq!(application_context_name.as_ref(), &[0, 4, 0, 0, 1, 0, 20, 3]);
+        }
+        _ => unreachable!(),
+    }
+}
+```
+
+`DialoguePortion { external }` remains a raw escape hatch: any dialogue bytes can
+still be carried verbatim, and `dialogue_pdu()` returns `None` for a portion the
+typed layer does not model (e.g. structured-dialogue AUDT, which is out of scope).
+`user_information` stays opaque (`Option<Vec<u8>>`) — enough to carry a nested APDU.
 
 ## Where it fits
 
@@ -108,8 +146,21 @@ The Python surface mirrors the Rust one: the transaction messages (`Begin`,
 `Continue`, `End`, `Abort`, `Unidirectional`), the components (`Invoke`,
 `ReturnResult`, `ReturnError`, `Reject`), `OperationCode` / `ErrorCode`
 (local integer or global OID), plus `encode()` / `decode()` and the Q.773
-tag / component-type constants. Opaque fields (operation arguments, the dialogue
-`EXTERNAL`, a `Reject` problem) are `bytes`, exactly as the Rust codec keeps them.
+tag / component-type constants. Opaque fields (operation arguments, a `Reject`
+problem) are `bytes`, exactly as the Rust codec keeps them. The dialogue portion
+has typed helpers — `dialogue_aarq(oid)`, `dialogue_aare_accept(oid)`,
+`dialogue_abrt(source)` return the `EXTERNAL` bytes for a message's
+`dialogue_portion=`, and `parse_dialogue_portion(bytes)` reads one back into a
+`DialoguePdu` (`.pdu_type`, `.application_context`, `.result`, `.abort_source`):
+
+```python
+dp = tcap.dialogue_aarq([0, 4, 0, 0, 1, 0, 20, 3])   # MAP SRI-SM context
+begin = tcap.Begin(b"\x00\x00\x00\x01", dialogue_portion=dp)
+
+pdu = tcap.parse_dialogue_portion(tcap.decode(begin.encode()).dialogue_portion)
+assert pdu.pdu_type == "AARQ" and pdu.application_context == [0, 4, 0, 0, 1, 0, 20, 3]
+```
+
 The module is declared `gil_used = false`, so it loads on free-threaded CPython.
 
 ## Development

@@ -41,7 +41,10 @@ pub mod types;
 pub mod python;
 
 pub use component::{Component, Invoke, Reject, ReturnError, ReturnResult, ReturnResultValue};
-pub use dialogue::DialoguePortion;
+pub use dialogue::{
+    AbortSource, ApplicationContextName, AssociateResult, AssociateSourceDiagnostic, DialoguePdu,
+    DialoguePortion, ProtocolVersion,
+};
 pub use error::TcapError;
 pub use transaction::{Abort, Begin, Continue, End, TcapMessage, Unidirectional};
 pub use types::{ErrorCode, InvokeId, OperationCode};

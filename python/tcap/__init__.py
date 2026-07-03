@@ -22,6 +22,8 @@ from __future__ import annotations
 from importlib.metadata import PackageNotFoundError, version
 
 from ._tcap import (
+    ABORT_SOURCE_PROVIDER,
+    ABORT_SOURCE_USER,
     COMPONENT_INVOKE,
     COMPONENT_REJECT,
     COMPONENT_RETURN_ERROR,
@@ -35,6 +37,7 @@ from ._tcap import (
     Abort,
     Begin,
     Continue,
+    DialoguePdu,
     End,
     ErrorCode,
     Invoke,
@@ -45,7 +48,11 @@ from ._tcap import (
     TcapError,
     Unidirectional,
     decode,
+    dialogue_aarq,
+    dialogue_aare_accept,
+    dialogue_abrt,
     encode,
+    parse_dialogue_portion,
 )
 
 try:
@@ -73,6 +80,14 @@ __all__ = [
     "encode",
     "decode",
     "TcapError",
+    # dialogue portion (AARQ / AARE / ABRT)
+    "DialoguePdu",
+    "dialogue_aarq",
+    "dialogue_aare_accept",
+    "dialogue_abrt",
+    "parse_dialogue_portion",
+    "ABORT_SOURCE_USER",
+    "ABORT_SOURCE_PROVIDER",
     # transaction PDU tags (Q.773)
     "TAG_UNIDIRECTIONAL",
     "TAG_BEGIN",

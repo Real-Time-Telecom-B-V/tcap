@@ -245,3 +245,73 @@ def test_decode_truncated_raises() -> None:
 def test_encode_rejects_non_message() -> None:
     with pytest.raises(tcap.TcapError):
         tcap.encode(tcap.Invoke(1, tcap.OperationCode.local(45)))  # a component, not a message
+
+
+# ── Dialogue portion (AARQ / AARE / ABRT) ─────────────────────────────────────
+
+# MAP shortMsgGateway v3 — a real, registered application context (SRI-SM).
+MAP_SRI_SM_AC = [0, 4, 0, 0, 1, 0, 20, 3]
+# CAP gsmSSF-scfGeneric v3 — the CAMEL call application context.
+CAP_GSMSSF_SCF_AC = [0, 4, 0, 0, 1, 21, 3, 4]
+
+
+def test_dialogue_aarq_starts_at_external_tag() -> None:
+    dp = tcap.dialogue_aarq(MAP_SRI_SM_AC)
+    # The EXTERNAL tag 0x28, NOT the outer [APPLICATION 11] 0x6B (tcap adds that).
+    assert dp[0] == 0x28
+    # AARQ tag 0x60 appears inside.
+    assert 0x60 in dp
+
+
+def test_dialogue_aarq_round_trips_through_begin() -> None:
+    dp = tcap.dialogue_aarq(MAP_SRI_SM_AC)
+    begin = tcap.Begin(b"\x00\x00\x00\x01", dialogue_portion=dp)
+    decoded = tcap.decode(begin.encode())
+    assert decoded.dialogue_portion == dp
+    pdu = tcap.parse_dialogue_portion(decoded.dialogue_portion)
+    assert pdu is not None
+    assert pdu.pdu_type == "AARQ"
+    assert pdu.application_context == MAP_SRI_SM_AC
+    assert pdu.result is None
+    assert pdu.abort_source is None
+
+
+def test_dialogue_aare_accept_read_back() -> None:
+    dp = tcap.dialogue_aare_accept(CAP_GSMSSF_SCF_AC)
+    end = tcap.End(b"\x00\x00\x00\x02", dialogue_portion=dp)
+    decoded = tcap.decode(end.encode())
+    pdu = tcap.parse_dialogue_portion(decoded.dialogue_portion)
+    assert pdu is not None
+    assert pdu.pdu_type == "AARE"
+    assert pdu.application_context == CAP_GSMSSF_SCF_AC
+    assert pdu.result == 0  # accepted
+    assert pdu.result_source_diagnostic == (1, 0)  # dialogue-service-user null(0)
+
+
+def test_dialogue_abrt_round_trip() -> None:
+    dp = tcap.dialogue_abrt(tcap.ABORT_SOURCE_PROVIDER)
+    pdu = tcap.parse_dialogue_portion(dp)
+    assert pdu is not None
+    assert pdu.pdu_type == "ABRT"
+    assert pdu.abort_source == tcap.ABORT_SOURCE_PROVIDER
+    assert pdu.application_context is None
+
+
+def test_dialogue_abrt_source_constants() -> None:
+    assert tcap.ABORT_SOURCE_USER == 0
+    assert tcap.ABORT_SOURCE_PROVIDER == 1
+
+
+def test_dialogue_abrt_rejects_bad_source() -> None:
+    with pytest.raises(tcap.TcapError):
+        tcap.dialogue_abrt(7)
+
+
+def test_dialogue_aarq_rejects_bad_oid() -> None:
+    with pytest.raises(tcap.TcapError):
+        tcap.dialogue_aarq([3, 0, 0])  # first arc > 2 is not a valid OID
+
+
+def test_parse_non_dialogue_returns_none() -> None:
+    # A well-formed EXTERNAL but not the dialogue-as OID — not a dialogue PDU.
+    assert tcap.parse_dialogue_portion(bytes([0x28, 0x03, 0x06, 0x01, 0x2A])) is None

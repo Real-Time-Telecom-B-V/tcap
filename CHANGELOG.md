@@ -20,7 +20,13 @@ ITU-T Q.771–Q.775.
   `ReturnResultValue` values.
 - **`OperationCode`** / **`ErrorCode`** — local (integer) or global (OID) forms.
 - **`DialoguePortion`** — the `EXTERNAL`-wrapped dialogue PDU (AARQ/AARE/ABRT)
-  for application-context negotiation, carried opaquely.
+  for application-context negotiation. A **typed** layer sits over the raw
+  `external` escape hatch: the `DialoguePdu` enum (`Aarq` / `Aare` / `Abrt`) with
+  `AssociateResult`, `AssociateSourceDiagnostic`, `AbortSource`, and
+  `ProtocolVersion`; byte-exact builders `aarq(ac)` / `aare_accept(ac)` /
+  `abrt(source)` / `from_pdu(pdu)`; and a `dialogue_pdu()` parser that reads a
+  received portion back into the typed form (round-trips). `user_information`
+  stays opaque; structured-dialogue AUDT is out of scope.
 - **`TcapError`** — `thiserror` enum over encode / decode / invalid-message /
   missing-field, with `From` conversions off `rasn`'s error types.
 - `Display` for `TcapMessage`, `Component`, `OperationCode`, and `ErrorCode`.
@@ -30,7 +36,11 @@ ITU-T Q.771–Q.775.
   `python`) — the transaction messages (`Begin`, `Continue`, `End`, `Abort`,
   `Unidirectional`), the components (`Invoke`, `ReturnResult`, `ReturnError`,
   `Reject`), `OperationCode` / `ErrorCode`, `encode()` / `decode()`, and the
-  Q.773 tag / component-type constants. Opaque fields are `bytes`. Declared
+  Q.773 tag / component-type constants. Opaque fields are `bytes`. The dialogue
+  portion has typed helpers — `dialogue_aarq` / `dialogue_aare_accept` /
+  `dialogue_abrt` builders and a `parse_dialogue_portion()` reader returning a
+  `DialoguePdu` (with `pdu_type` / `application_context` / `result` /
+  `abort_source`), plus the `ABORT_SOURCE_*` constants. Declared
   `gil_used = false` for free-threaded CPython. A `register(py, parent)` entry
   point mounts `tcap` as a submodule of a host extension. (The crates.io crate
   stays `tcap`; only the PyPI distribution is `ss7-tcap`, as `tcap` is taken.)
