@@ -73,4 +73,4 @@ it.
    m3ua / mtp3         (SS7 network transport)
 ```
 
-Part of the RTT SS7 stack: SCCP carries TCAP; MAP builds on it.
+Stack position: SCCP carries TCAP; MAP builds on it.
