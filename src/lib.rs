@@ -61,7 +61,7 @@
 
 mod ber;
 pub mod component;
-pub mod decode;
+mod decode;
 pub mod dialogue;
 pub mod error;
 pub mod transaction;
