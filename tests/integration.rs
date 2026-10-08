@@ -53,9 +53,16 @@ fn abort_tag_value() {
 /// Verify Unidirectional tag is APPLICATION 1 CONSTRUCTED (0x61).
 #[test]
 fn unidirectional_tag_value() {
+    // A Unidirectional has a mandatory component portion of at least one
+    // component.
     let uni = Unidirectional {
         dialogue_portion: None,
-        components: vec![],
+        components: vec![Component::Invoke(Invoke {
+            invoke_id: 0,
+            linked_id: None,
+            operation_code: OperationCode::Local(45),
+            parameter: None,
+        })],
     };
     let bytes = encode(&TcapMessage::Unidirectional(uni)).unwrap();
     assert_eq!(bytes[0], 0x61); // [APPLICATION 1] CONSTRUCTED
@@ -104,15 +111,14 @@ fn multiple_invoke_components() {
     // Verify it at least encodes without error
 }
 
-/// ReturnResult with operation code and no parameter.
+/// ReturnResult for an operation that returns nothing: no result sequence.
+/// (Q.773 has no result sequence with an operation code and no parameter, and
+/// `encode` refuses one.)
 #[test]
 fn return_result_no_param() {
     let rr = ReturnResult {
         invoke_id: 1,
-        result: Some(ReturnResultValue {
-            operation_code: OperationCode::Local(45),
-            parameter: None,
-        }),
+        result: None,
     };
 
     let end = End {
@@ -134,10 +140,7 @@ fn return_result_no_param() {
 /// Reject component round-trip.
 #[test]
 fn reject_component() {
-    let reject = Reject {
-        invoke_id: 99,
-        problem: rasn::types::Any::new(vec![0x80, 0x01, 0x01]), // general problem: unrecognized component
-    };
+    let reject = Reject::general(Some(99), GeneralProblem::MISTYPED_COMPONENT);
 
     let end = End {
         dtid: vec![0x01].into(),
@@ -151,7 +154,13 @@ fn reject_component() {
         TcapMessage::End(e) => {
             let comps = e.components.unwrap();
             match &comps[0] {
-                Component::Reject(rj) => assert_eq!(rj.invoke_id, 99),
+                Component::Reject(rj) => {
+                    assert_eq!(rj.invoke_id, Some(99));
+                    assert_eq!(
+                        rj.problem,
+                        Problem::General(GeneralProblem::MISTYPED_COMPONENT)
+                    );
+                }
                 _ => panic!("Expected Reject"),
             }
         }
@@ -283,10 +292,14 @@ fn global_error_code_round_trip() {
 /// A Begin carrying a dialogue portion round-trips with the portion intact.
 #[test]
 fn dialogue_portion_round_trip() {
-    // Synthetic EXTERNAL-shaped bytes (tag 0x28 = [UNIVERSAL 8] EXTERNAL). The
-    // codec carries these opaquely; the dialogue layer above decodes them.
+    // A synthetic EXTERNAL (tag 0x28 = [UNIVERSAL 8]) in the made-up abstract
+    // syntax 2.999.1, holding an OCTET STRING as a single-ASN1-type. The codec
+    // carries it verbatim. (An EXTERNAL has to have its encoding member; one
+    // without is refused.)
     let dp = DialoguePortion {
-        external: rasn::types::Any::new(vec![0x28, 0x03, 0x06, 0x01, 0x2A]),
+        external: rasn::types::Any::new(vec![
+            0x28, 0x0A, 0x06, 0x03, 0x88, 0x37, 0x01, 0xA0, 0x03, 0x04, 0x01, 0x01,
+        ]),
     };
     let begin = Begin {
         otid: vec![0x01].into(),
@@ -362,19 +375,22 @@ fn continue_with_component_round_trip() {
 /// An Abort carrying a reason round-trips with the reason present.
 #[test]
 fn abort_with_reason_round_trip() {
-    let abort = Abort {
-        dtid: vec![0x03].into(),
-        // Synthetic P-Abort cause bytes, carried opaquely.
-        reason: Some(rasn::types::Any::new(vec![0x0A, 0x01, 0x01])),
-    };
+    let abort = Abort::p_abort(vec![0x03].into(), PAbortCause::UNRECOGNIZED_TRANSACTION_ID);
 
     let wire = encode(&TcapMessage::Abort(abort)).unwrap();
+    // Abort { dtid 03, P-AbortCause [APPLICATION 10] IMPLICIT INTEGER 1 }.
+    assert_eq!(wire, [0x67, 0x06, 0x49, 0x01, 0x03, 0x4a, 0x01, 0x01]);
     let decoded = decode(&wire).unwrap();
 
     match decoded {
         TcapMessage::Abort(a) => {
             assert_eq!(a.dtid.as_ref(), &[0x03]);
-            assert!(a.reason.is_some());
+            assert_eq!(
+                a.reason,
+                Some(AbortReason::PAbort(
+                    PAbortCause::UNRECOGNIZED_TRANSACTION_ID
+                ))
+            );
         }
         _ => panic!("Expected Abort"),
     }
@@ -388,8 +404,10 @@ fn abort_with_reason_round_trip() {
 #[test]
 fn decode_garbage_is_error() {
     let err = decode(&[0xFF, 0x00, 0x99]).unwrap_err();
-    // The Display impl should mention it was a decode failure.
-    assert!(format!("{err}").contains("decode"));
+    // The Display impl says what is wrong and where.
+    let text = format!("{err}");
+    assert!(text.contains("malformed message"), "{text}");
+    assert!(text.contains("transaction portion"), "{text}");
 }
 
 /// A truncated message (valid Begin tag, bogus length) fails cleanly.

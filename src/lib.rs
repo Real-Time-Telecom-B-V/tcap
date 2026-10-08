@@ -5,7 +5,35 @@
 //! - Component types: Invoke, ReturnResult, ReturnError, Reject
 //! - Dialogue portion for application context negotiation
 //!
-//! Uses `rasn` for ASN.1 BER encoding/decoding.
+//! Uses `rasn` for ASN.1 BER encoding/decoding of the components.
+//!
+//! # Decoding never loses anything silently
+//!
+//! [`decode`] returns a message only when every part of it was understood and
+//! every octet of the input belongs to it. Otherwise it fails with
+//! [`TcapError::Malformed`], which carries a [`DecodeProblem`]: which
+//! sub-layer detected the problem, the P-Abort cause or the general problem
+//! code, the transaction IDs and the invoke ID that could be recovered, and,
+//! for a problem in a component, the message up to that component.
+//! [`DecodeProblem::abort`] and [`DecodeProblem::reject`] build the response
+//! Q.774 requires. [`decode_detailed`] gives the same as a plain value.
+//!
+//! ```
+//! use tcap::{Decoded, GeneralProblem, Reject};
+//!
+//! // A Begin whose only Invoke stops after the invoke ID.
+//! let wire = [
+//!     0x62, 0x0d, 0x48, 0x04, 0x00, 0x00, 0x10, 0x01, 0x6c, 0x05, 0xa1, 0x03, 0x02, 0x01, 0x02,
+//! ];
+//! let Decoded::Problem(problem) = tcap::decode_detailed(&wire) else {
+//!     panic!("this message is not valid");
+//! };
+//! assert_eq!(
+//!     problem.reject(),
+//!     Some(Reject::general(Some(2), GeneralProblem::MISTYPED_COMPONENT))
+//! );
+//! assert!(tcap::decode(&wire).is_err());
+//! ```
 //!
 //! # Example
 //!
@@ -31,7 +59,9 @@
 //! let decoded = tcap::decode(&encoded).unwrap();
 //! ```
 
+mod ber;
 pub mod component;
+pub mod decode;
 pub mod dialogue;
 pub mod error;
 pub mod transaction;
@@ -40,27 +70,115 @@ pub mod types;
 #[cfg(feature = "python")]
 pub mod python;
 
-pub use component::{Component, Invoke, Reject, ReturnError, ReturnResult, ReturnResultValue};
+pub use component::{
+    Component, ComponentType, Invoke, Problem, Reject, ReturnError, ReturnResult, ReturnResultValue,
+};
+pub use decode::{decode_detailed, DecodeProblem, Decoded, Fault, Sublayer};
 pub use dialogue::{
-    AbortSource, ApplicationContextName, AssociateResult, AssociateSourceDiagnostic, DialoguePdu,
-    DialoguePortion, ProtocolVersion,
+    AbortSource, ApplicationContextName, AssociateResult, AssociateSourceDiagnostic,
+    DialogueContent, DialogueError, DialoguePdu, DialoguePortion, External, ExternalEncoding,
+    ProtocolVersion,
 };
 pub use error::TcapError;
-pub use transaction::{Abort, Begin, Continue, End, TcapMessage, Unidirectional};
-pub use types::{ErrorCode, InvokeId, OperationCode};
+pub use transaction::{
+    Abort, AbortReason, Begin, Continue, End, MessageType, TcapMessage, Unidirectional,
+};
+pub use types::{
+    ErrorCode, GeneralProblem, InvokeId, InvokeProblem, OperationCode, PAbortCause,
+    ReturnErrorProblem, ReturnResultProblem, TransactionId,
+};
 
-/// Encode a TCAP message to wire-correct BER bytes.
+/// Encode a TCAP message to BER as Q.773 specifies it.
 ///
-/// With implicit APPLICATION tags, rasn directly produces Q.773-compliant encoding.
+/// A message Q.773 does not allow is refused with
+/// [`TcapError::InvalidMessage`] instead of being put on the wire:
+///
+/// * a transaction ID that is not 1 to 4 octets long (`SIZE (1..4)`);
+/// * a component portion with no components (`SIZE (1..MAX)`): leave
+///   `components` as `None` for a message without components;
+/// * a ReturnResult whose `result` has no parameter (the parameter of the
+///   result sequence is not OPTIONAL): leave `result` as `None`;
+/// * a parameter that is not exactly one BER element;
+/// * a dialogue portion that is not a well-formed `EXTERNAL`, or that names a
+///   Q.773 dialogue abstract syntax and does not hold a well-formed PDU.
 pub fn encode(msg: &TcapMessage) -> Result<Vec<u8>, TcapError> {
+    validate(msg).map_err(TcapError::InvalidMessage)?;
     let raw = rasn::ber::encode(msg)?;
     Ok(raw)
 }
 
-/// Decode a TCAP message from wire-correct BER bytes.
+/// Decode one TCAP message that has to be fully valid.
+///
+/// `bytes` is the user data of one SCCP message and must be exactly one TCAP
+/// message. Any part that cannot be understood makes the whole call fail with
+/// [`TcapError::Malformed`]: a message is never returned without a component,
+/// a dialogue portion or trailing octets that were on the wire. The error
+/// carries the [`DecodeProblem`], from which the Abort or Reject that Q.774
+/// requires is built. [`decode_detailed`] returns the same information
+/// without going through an error.
 pub fn decode(bytes: &[u8]) -> Result<TcapMessage, TcapError> {
-    let msg = rasn::ber::decode::<TcapMessage>(bytes)?;
-    Ok(msg)
+    decode_detailed(bytes)
+        .into_result()
+        .map_err(TcapError::Malformed)
+}
+
+fn validate(msg: &TcapMessage) -> Result<(), String> {
+    for (name, id) in [("originating", msg.otid()), ("destination", msg.dtid())] {
+        if let Some(id) = id {
+            if !(1..=4).contains(&id.len()) {
+                return Err(format!(
+                    "{name} transaction ID is {} octets long, Q.773 allows 1 to 4",
+                    id.len()
+                ));
+            }
+        }
+    }
+
+    let empty_portion = match msg {
+        TcapMessage::Unidirectional(uni) => uni.components.is_empty(),
+        TcapMessage::Begin(Begin { components, .. })
+        | TcapMessage::End(End { components, .. })
+        | TcapMessage::Continue(Continue { components, .. }) => {
+            components.as_ref().is_some_and(Vec::is_empty)
+        }
+        TcapMessage::Abort(_) => false,
+    };
+    if empty_portion {
+        return Err("a component portion holds at least one component".to_string());
+    }
+
+    for (index, component) in msg.components().iter().enumerate() {
+        let parameter = match component {
+            Component::Invoke(invoke) => invoke.parameter.as_ref(),
+            Component::ReturnError(error) => error.parameter.as_ref(),
+            Component::ReturnResultLast(result) | Component::ReturnResultNotLast(result) => {
+                match &result.result {
+                    Some(value) => Some(value.parameter.as_ref().ok_or_else(|| {
+                        format!(
+                            "component {index}: the result of a ReturnResult has no parameter, \
+                             leave the result out instead"
+                        )
+                    })?),
+                    None => None,
+                }
+            }
+            Component::Reject(_) => None,
+        };
+        if let Some(parameter) = parameter {
+            let sole = ber::element(parameter.as_bytes())
+                .map_err(|e| format!("component {index}: parameter: {e}"))?;
+            if !sole.rest.is_empty() {
+                return Err(format!(
+                    "component {index}: the parameter is more than one element"
+                ));
+            }
+        }
+    }
+
+    if let Some(portion) = msg.dialogue_portion() {
+        portion.parse().map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -118,7 +236,8 @@ mod tests {
             invoke_id: 1,
             result: Some(ReturnResultValue {
                 operation_code: OperationCode::Local(45),
-                parameter: None,
+                // An empty SEQUENCE as the result parameter.
+                parameter: Some(rasn::types::Any::new(vec![0x30, 0x00])),
             }),
         };
 

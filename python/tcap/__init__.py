@@ -6,12 +6,15 @@ the same BER codec the Rust crate (``cargo add tcap``) ships, from one source
 tree / one version: build a transaction (``Begin`` / ``Continue`` / ``End`` /
 ``Abort`` / ``Unidirectional``) with its components (``Invoke`` /
 ``ReturnResult`` / ``ReturnError`` / ``Reject``), call ``.encode()`` for wire
-bytes, and ``tcap.decode(bytes)`` to parse.
+bytes, and ``tcap.decode(bytes)`` to parse. ``decode`` raises ``TcapError``
+when any part of a message was not understood, with the ``DecodeProblem`` (the
+P-Abort cause or Reject problem and the ids Q.774 needs for the answer) as its
+``problem`` attribute; ``decode_detailed`` returns it without raising.
 
 The wire work (BER encode/decode, tag handling) runs in Rust; Python just builds
-and inspects messages. Operation arguments, the dialogue ``EXTERNAL``, and a
-``Reject`` problem are carried opaquely as ``bytes`` — the application layer
-above (e.g. a MAP stack) decodes them.
+and inspects messages. Operation arguments and the dialogue ``EXTERNAL`` are
+carried opaquely as ``bytes`` — the application layer above (e.g. a MAP stack)
+decodes them.
 
 Note: the PyPI distribution is ``ss7-tcap`` (``tcap`` is taken), but the import
 name is ``tcap``.
@@ -29,6 +32,18 @@ from ._tcap import (
     COMPONENT_RETURN_ERROR,
     COMPONENT_RETURN_RESULT_LAST,
     COMPONENT_RETURN_RESULT_NOT_LAST,
+    GENERAL_PROBLEM_BADLY_STRUCTURED_COMPONENT,
+    GENERAL_PROBLEM_MISTYPED_COMPONENT,
+    GENERAL_PROBLEM_UNRECOGNIZED_COMPONENT,
+    P_ABORT_BADLY_FORMATTED_TRANSACTION_PORTION,
+    P_ABORT_INCORRECT_TRANSACTION_PORTION,
+    P_ABORT_RESOURCE_LIMITATION,
+    P_ABORT_UNRECOGNIZED_MESSAGE_TYPE,
+    P_ABORT_UNRECOGNIZED_TRANSACTION_ID,
+    PROBLEM_GENERAL,
+    PROBLEM_INVOKE,
+    PROBLEM_RETURN_ERROR,
+    PROBLEM_RETURN_RESULT,
     TAG_ABORT,
     TAG_BEGIN,
     TAG_CONTINUE,
@@ -37,6 +52,7 @@ from ._tcap import (
     Abort,
     Begin,
     Continue,
+    DecodeProblem,
     DialoguePdu,
     End,
     ErrorCode,
@@ -48,9 +64,12 @@ from ._tcap import (
     TcapError,
     Unidirectional,
     decode,
+    decode_detailed,
     dialogue_aarq,
     dialogue_aare_accept,
+    dialogue_aare_reject,
     dialogue_abrt,
+    dialogue_audt,
     encode,
     parse_dialogue_portion,
 )
@@ -79,15 +98,33 @@ __all__ = [
     # codec
     "encode",
     "decode",
+    "decode_detailed",
+    "DecodeProblem",
     "TcapError",
-    # dialogue portion (AARQ / AARE / ABRT)
+    # dialogue portion (AARQ / AARE / ABRT / AUDT)
     "DialoguePdu",
     "dialogue_aarq",
     "dialogue_aare_accept",
+    "dialogue_aare_reject",
     "dialogue_abrt",
+    "dialogue_audt",
     "parse_dialogue_portion",
     "ABORT_SOURCE_USER",
     "ABORT_SOURCE_PROVIDER",
+    # P-Abort causes (Q.773 Table 12)
+    "P_ABORT_UNRECOGNIZED_MESSAGE_TYPE",
+    "P_ABORT_UNRECOGNIZED_TRANSACTION_ID",
+    "P_ABORT_BADLY_FORMATTED_TRANSACTION_PORTION",
+    "P_ABORT_INCORRECT_TRANSACTION_PORTION",
+    "P_ABORT_RESOURCE_LIMITATION",
+    # Reject problem classes and general problems (Q.773 Tables 25, 26)
+    "PROBLEM_GENERAL",
+    "PROBLEM_INVOKE",
+    "PROBLEM_RETURN_RESULT",
+    "PROBLEM_RETURN_ERROR",
+    "GENERAL_PROBLEM_UNRECOGNIZED_COMPONENT",
+    "GENERAL_PROBLEM_MISTYPED_COMPONENT",
+    "GENERAL_PROBLEM_BADLY_STRUCTURED_COMPONENT",
     # transaction PDU tags (Q.773)
     "TAG_UNIDIRECTIONAL",
     "TAG_BEGIN",
