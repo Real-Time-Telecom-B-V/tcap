@@ -1,10 +1,10 @@
 """Type stubs for the Rust-backed ``tcap._tcap`` extension module.
 
 TCAP messages carry application-decoded content (operation arguments, the
-dialogue ``EXTERNAL``, a ``Reject`` problem) as opaque BER — those fields are
-``bytes`` here, exactly as the Rust codec keeps them. Transaction ids
-(OTID/DTID) are ``bytes``; invoke ids and local operation/error codes are
-``int``.
+dialogue ``EXTERNAL``) as opaque BER — those fields are ``bytes`` here, exactly
+as the Rust codec keeps them. Transaction ids (OTID/DTID) are ``bytes`` of 1 to
+4 octets; invoke ids (-128..127), local operation/error codes, the P-Abort
+cause and the Reject problem class and code are ``int``.
 """
 
 from __future__ import annotations
@@ -25,12 +25,34 @@ COMPONENT_RETURN_ERROR: int
 COMPONENT_REJECT: int
 COMPONENT_RETURN_RESULT_NOT_LAST: int
 
-# ── ABRT-source values (X.880) ────────────────────────────────────────────────
+# ── ABRT-source values (Q.773 §3.2.1) ─────────────────────────────────────────
 ABORT_SOURCE_USER: int
 ABORT_SOURCE_PROVIDER: int
 
+# ── P-Abort causes (Q.773 Table 12) ───────────────────────────────────────────
+P_ABORT_UNRECOGNIZED_MESSAGE_TYPE: int
+P_ABORT_UNRECOGNIZED_TRANSACTION_ID: int
+P_ABORT_BADLY_FORMATTED_TRANSACTION_PORTION: int
+P_ABORT_INCORRECT_TRANSACTION_PORTION: int
+P_ABORT_RESOURCE_LIMITATION: int
+
+# ── Reject problem classes (Q.773 Table 25) and general problems (Table 26) ───
+PROBLEM_GENERAL: int
+PROBLEM_INVOKE: int
+PROBLEM_RETURN_RESULT: int
+PROBLEM_RETURN_ERROR: int
+GENERAL_PROBLEM_UNRECOGNIZED_COMPONENT: int
+GENERAL_PROBLEM_MISTYPED_COMPONENT: int
+GENERAL_PROBLEM_BADLY_STRUCTURED_COMPONENT: int
+
 class TcapError(Exception):
-    """TCAP protocol / codec error (ITU-T Q.771–Q.775)."""
+    """TCAP protocol / codec error (ITU-T Q.771–Q.775).
+
+    When raised by ``decode`` for a message that was not fully understood, the
+    ``problem`` attribute holds the ``DecodeProblem``.
+    """
+
+    problem: DecodeProblem
 
 class OperationCode:
     """A TCAP operation code — a ``local`` integer or a ``global`` OID."""
@@ -116,11 +138,17 @@ class ReturnError:
     ) -> None: ...
 
 class Reject:
-    """A TCAP Reject component — rejects a received component."""
+    """A TCAP Reject component — rejects a received component.
 
-    invoke_id: int
-    problem: bytes
-    def __init__(self, invoke_id: int, problem: bytes) -> None: ...
+    ``invoke_id`` is ``None`` when the invoke ID of the rejected component could
+    not be derived (sent as a NULL). ``problem_type`` is the problem class
+    (``PROBLEM_*``) and ``problem_code`` its value (Q.773 Tables 26 to 29).
+    """
+
+    invoke_id: int | None
+    problem_type: int
+    problem_code: int
+    def __init__(self, invoke_id: int | None, problem_type: int, problem_code: int) -> None: ...
 
 Component = Invoke | ReturnResult | ReturnError | Reject
 
@@ -177,8 +205,15 @@ class Abort:
     """A TCAP Abort transaction (``[APPLICATION 7]``) — aborts a dialogue."""
 
     dtid: bytes
-    reason: bytes | None
-    def __init__(self, dtid: bytes, *, reason: bytes | None = None) -> None: ...
+    p_abort_cause: int | None
+    dialogue_portion: bytes | None
+    def __init__(
+        self,
+        dtid: bytes,
+        *,
+        p_abort_cause: int | None = None,
+        dialogue_portion: bytes | None = None,
+    ) -> None: ...
     def encode(self) -> bytes: ...
 
 class Unidirectional:
@@ -200,25 +235,78 @@ def encode(message: Message) -> bytes:
     """Encode any TCAP message to BER bytes (same as ``message.encode()``)."""
 
 def decode(data: bytes) -> Message:
-    """Decode a TCAP message from BER bytes into the matching message class."""
+    """Decode a TCAP message from BER bytes into the matching message class.
+
+    The message has to be fully valid: when any part of it was not understood,
+    ``TcapError`` is raised with the ``DecodeProblem`` as its ``problem``
+    attribute. A message is never returned without something that was on the
+    wire.
+    """
+
+def decode_detailed(data: bytes) -> Message | DecodeProblem:
+    """Decode without raising: the message, or a ``DecodeProblem``."""
+
+class DecodeProblem:
+    """A message that was not fully understood, with what Q.774 needs to answer it."""
+
+    @property
+    def sublayer(self) -> str:
+        """``"transaction"`` or ``"component"``: the sub-layer that detected it."""
+    @property
+    def fault(self) -> str:
+        """``"transaction_portion"``, ``"dialogue_portion"`` or ``"component"``."""
+    @property
+    def p_abort_cause(self) -> int | None:
+        """The P-Abort cause, for a transaction portion fault."""
+    @property
+    def general_problem(self) -> int | None:
+        """The general problem code, for a component fault."""
+    @property
+    def component_index(self) -> int | None: ...
+    @property
+    def component_type(self) -> int | None:
+        """``COMPONENT_*`` of the faulty component, ``None`` if not recognized."""
+    @property
+    def invoke_id(self) -> int | None:
+        """The invoke ID of the faulty component, ``None`` if not derivable."""
+    @property
+    def message_type(self) -> int | None:
+        """``TAG_*`` of the message, ``None`` if not recognized."""
+    @property
+    def otid(self) -> bytes | None: ...
+    @property
+    def dtid(self) -> bytes | None: ...
+    @property
+    def partial(self) -> Message | None:
+        """For a component fault: the message with the components before it."""
+    @property
+    def detail(self) -> str: ...
+    def abort(self) -> Abort | None:
+        """The Abort to send to the originator, or ``None``."""
+    def reject(self) -> Reject | None:
+        """The Reject component to send, or ``None``."""
 
 # ── Dialogue portion (AARQ / AARE / ABRT) ─────────────────────────────────────
 class DialoguePdu:
     """A decoded dialogue PDU read back from a message's ``dialogue_portion``.
 
-    Inspect ``pdu_type`` (``"AARQ"`` / ``"AARE"`` / ``"ABRT"``); AARQ/AARE expose
-    ``application_context`` (OID arcs) and AARE also ``result`` and
-    ``result_source_diagnostic``; ABRT exposes ``abort_source``.
+    Inspect ``pdu_type`` (``"AARQ"`` / ``"AARE"`` / ``"ABRT"`` / ``"AUDT"``);
+    AARQ/AARE/AUDT expose ``application_context`` (OID arcs) and ``version1``,
+    AARE also ``result`` and ``result_source_diagnostic``; ABRT exposes
+    ``abort_source``.
     """
 
     @property
     def pdu_type(self) -> str: ...
     @property
     def application_context(self) -> list[int] | None:
-        """The application-context-name OID arcs (AARQ / AARE), else ``None``."""
+        """The application-context-name OID arcs (AARQ / AARE / AUDT), else ``None``."""
+    @property
+    def version1(self) -> bool | None:
+        """Whether the protocol version lists version 1 (AARQ / AARE / AUDT)."""
     @property
     def result(self) -> int | None:
-        """AARE associate result: 0 accepted, 1 reject-permanent, 2 reject-transient."""
+        """AARE associate result: 0 accepted, 1 reject-permanent."""
     @property
     def result_source_diagnostic(self) -> tuple[int, int] | None:
         """AARE ``(source, value)``; source 1 = user, 2 = provider."""
@@ -227,7 +315,7 @@ class DialoguePdu:
         """ABRT source: 0 = user, 1 = provider."""
     @property
     def user_information(self) -> bytes | None:
-        """The opaque user-information ``[30]`` content octets, if present."""
+        """The user-information ``[30]`` content octets (its EXTERNALs), if present."""
 
 def dialogue_aarq(application_context: Sequence[int]) -> bytes:
     """Build an AARQ dialogue portion (``EXTERNAL`` bytes) for the given OID arcs."""
@@ -235,8 +323,19 @@ def dialogue_aarq(application_context: Sequence[int]) -> bytes:
 def dialogue_aare_accept(application_context: Sequence[int]) -> bytes:
     """Build an accepting AARE dialogue portion (``EXTERNAL`` bytes) for the OID arcs."""
 
+def dialogue_aare_reject(application_context: Sequence[int], source: int, value: int) -> bytes:
+    """Build a refusing AARE (reject-permanent) with diagnostic ``(source, value)``."""
+
 def dialogue_abrt(abort_source: int) -> bytes:
     """Build an ABRT dialogue portion for ``abort_source`` (0 = user, 1 = provider)."""
 
+def dialogue_audt(application_context: Sequence[int]) -> bytes:
+    """Build an AUDT dialogue portion (``EXTERNAL`` bytes), for a Unidirectional."""
+
 def parse_dialogue_portion(data: bytes) -> DialoguePdu | None:
-    """Parse a dialogue portion's ``EXTERNAL`` bytes into a ``DialoguePdu``, or ``None``."""
+    """Parse a dialogue portion's ``EXTERNAL`` bytes.
+
+    A ``DialoguePdu`` for an AARQ / AARE / ABRT / AUDT; ``None`` for a
+    well-formed ``EXTERNAL`` carrying something else; raises ``TcapError`` when
+    the portion is malformed.
+    """

@@ -10,12 +10,15 @@
 //!
 //! The Python surface is a faithful mirror of the Rust one. TCAP messages carry
 //! opaque, application-decoded content (operation arguments, the dialogue
-//! `EXTERNAL`, a `Reject` problem) as raw BER — so those fields are `bytes` on the
-//! Python side, exactly as the Rust codec keeps them as `rasn::types::Any`.
-//! Transaction ids (OTID/DTID) are `bytes`; invoke ids and local operation/error
-//! codes are `int`. Each message class builds and `.encode() -> bytes`; the
-//! module-level `decode(bytes)` dispatches on the transaction tag and returns the
-//! matching class.
+//! `EXTERNAL`) as raw BER — so those fields are `bytes` on the Python side,
+//! exactly as the Rust codec keeps them as `rasn::types::Any`. Transaction ids
+//! (OTID/DTID) are `bytes`; invoke ids, local operation/error codes, the P-Abort
+//! cause and the Reject problem class and code are `int`. Each message class
+//! builds and `.encode() -> bytes`; the module-level `decode(bytes)` dispatches
+//! on the transaction tag and returns the matching class, or raises `TcapError`
+//! with the `DecodeProblem` attached as `.problem` when any part of the message
+//! was not understood. `decode_detailed(bytes)` returns the message or the
+//! `DecodeProblem` without raising.
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -24,11 +27,15 @@ use pyo3::types::{PyBytes, PyModule};
 
 use rasn::types::{Any, ObjectIdentifier, OctetString};
 
-use crate::dialogue::{AbortSource, AssociateSourceDiagnostic, DialoguePdu as CoreDialoguePdu};
+use crate::dialogue::{
+    AbortSource, AssociateSourceDiagnostic, DialogueContent, DialoguePdu as CoreDialoguePdu,
+    External, ProtocolVersion,
+};
 use crate::{
-    Abort, Begin, Component, Continue, DialoguePortion, End, ErrorCode, Invoke, OperationCode,
-    Reject, ReturnError, ReturnResult, ReturnResultValue, TcapError as CoreTcapError, TcapMessage,
-    Unidirectional,
+    Abort, AbortReason, Begin, Component, Continue, DecodeProblem, Decoded, DialoguePortion, End,
+    ErrorCode, Fault, GeneralProblem, Invoke, InvokeId, InvokeProblem, OperationCode, PAbortCause,
+    Problem, Reject, ReturnError, ReturnErrorProblem, ReturnResult, ReturnResultProblem,
+    ReturnResultValue, Sublayer, TcapError as CoreTcapError, TcapMessage, Unidirectional,
 };
 
 // ── Error mapping ───────────────────────────────────────────────────────────
@@ -41,6 +48,19 @@ create_exception!(
 
 fn tcap_err(e: CoreTcapError) -> PyErr {
     TcapError::new_err(e.to_string())
+}
+
+/// The error for a message that was not fully understood: a `TcapError` whose
+/// `problem` attribute is the [`PyDecodeProblem`].
+fn malformed_err(py: Python<'_>, problem: DecodeProblem) -> PyErr {
+    let err = TcapError::new_err(format!("malformed message: {problem}"));
+    match Bound::new(py, PyDecodeProblem { inner: problem }) {
+        Ok(attached) => match err.value(py).setattr("problem", attached) {
+            Ok(()) => err,
+            Err(failure) => failure,
+        },
+        Err(failure) => failure,
+    }
 }
 
 // ── Q.773 transaction tags (APPLICATION class) ──────────────────────────────
@@ -199,9 +219,9 @@ impl PyErrorCode {
 #[derive(Clone)]
 pub struct PyInvoke {
     #[pyo3(get, set)]
-    pub invoke_id: i64,
+    pub invoke_id: InvokeId,
     #[pyo3(get, set)]
-    pub linked_id: Option<i64>,
+    pub linked_id: Option<InvokeId>,
     #[pyo3(get, set)]
     pub operation_code: PyOperationCode,
     /// Opaque operation argument (BER), decoded by the application (e.g. MAP).
@@ -213,9 +233,9 @@ impl PyInvoke {
     #[new]
     #[pyo3(signature = (invoke_id, operation_code, *, linked_id = None, parameter = None))]
     fn new(
-        invoke_id: i64,
+        invoke_id: InvokeId,
         operation_code: PyOperationCode,
-        linked_id: Option<i64>,
+        linked_id: Option<InvokeId>,
         parameter: Option<Vec<u8>>,
     ) -> Self {
         Self {
@@ -275,7 +295,7 @@ impl PyInvoke {
 #[derive(Clone)]
 pub struct PyReturnResult {
     #[pyo3(get, set)]
-    pub invoke_id: i64,
+    pub invoke_id: InvokeId,
     #[pyo3(get, set)]
     pub last: bool,
     #[pyo3(get, set)]
@@ -288,7 +308,7 @@ impl PyReturnResult {
     #[new]
     #[pyo3(signature = (invoke_id, *, operation_code = None, parameter = None, last = true))]
     fn new(
-        invoke_id: i64,
+        invoke_id: InvokeId,
         operation_code: Option<PyOperationCode>,
         parameter: Option<Vec<u8>>,
         last: bool,
@@ -356,7 +376,7 @@ impl PyReturnResult {
 #[derive(Clone)]
 pub struct PyReturnError {
     #[pyo3(get, set)]
-    pub invoke_id: i64,
+    pub invoke_id: InvokeId,
     #[pyo3(get, set)]
     pub error_code: PyErrorCode,
     parameter: Option<Vec<u8>>,
@@ -366,7 +386,7 @@ pub struct PyReturnError {
 impl PyReturnError {
     #[new]
     #[pyo3(signature = (invoke_id, error_code, *, parameter = None))]
-    fn new(invoke_id: i64, error_code: PyErrorCode, parameter: Option<Vec<u8>>) -> Self {
+    fn new(invoke_id: InvokeId, error_code: PyErrorCode, parameter: Option<Vec<u8>>) -> Self {
         Self {
             invoke_id,
             error_code,
@@ -413,50 +433,95 @@ impl PyReturnError {
     }
 }
 
-/// A TCAP Reject component — rejects a received component; `problem` is opaque BER.
+// ── Reject problem classes and codes (Q.773 Tables 25 to 29) ────────────────
+/// Problem class: general problem `[0]`.
+pub const PROBLEM_GENERAL: u8 = 0;
+/// Problem class: invoke problem `[1]`.
+pub const PROBLEM_INVOKE: u8 = 1;
+/// Problem class: return result problem `[2]`.
+pub const PROBLEM_RETURN_RESULT: u8 = 2;
+/// Problem class: return error problem `[3]`.
+pub const PROBLEM_RETURN_ERROR: u8 = 3;
+
+fn problem_parts(problem: Problem) -> (u8, i64) {
+    match problem {
+        Problem::General(code) => (PROBLEM_GENERAL, code.value()),
+        Problem::Invoke(code) => (PROBLEM_INVOKE, code.value()),
+        Problem::ReturnResult(code) => (PROBLEM_RETURN_RESULT, code.value()),
+        Problem::ReturnError(code) => (PROBLEM_RETURN_ERROR, code.value()),
+    }
+}
+
+fn problem_from_parts(problem_type: u8, problem_code: i64) -> PyResult<Problem> {
+    match problem_type {
+        PROBLEM_GENERAL => Ok(Problem::General(GeneralProblem(problem_code))),
+        PROBLEM_INVOKE => Ok(Problem::Invoke(InvokeProblem(problem_code))),
+        PROBLEM_RETURN_RESULT => Ok(Problem::ReturnResult(ReturnResultProblem(problem_code))),
+        PROBLEM_RETURN_ERROR => Ok(Problem::ReturnError(ReturnErrorProblem(problem_code))),
+        _ => Err(TcapError::new_err(
+            "problem_type must be 0 (general), 1 (invoke), 2 (return result) or 3 (return error)",
+        )),
+    }
+}
+
+/// A TCAP Reject component — rejects a received component.
+///
+/// `invoke_id` is `None` when the invoke ID of the rejected component could not
+/// be derived (sent as a NULL). `problem_type` is the problem class
+/// (`PROBLEM_GENERAL` / `PROBLEM_INVOKE` / `PROBLEM_RETURN_RESULT` /
+/// `PROBLEM_RETURN_ERROR`) and `problem_code` its value (Q.773 Tables 26 to 29).
 #[pyclass(name = "Reject", module = "tcap._tcap", from_py_object)]
 #[derive(Clone)]
 pub struct PyReject {
     #[pyo3(get, set)]
-    pub invoke_id: i64,
-    problem: Vec<u8>,
+    pub invoke_id: Option<InvokeId>,
+    #[pyo3(get)]
+    pub problem_type: u8,
+    #[pyo3(get, set)]
+    pub problem_code: i64,
 }
 
 #[pymethods]
 impl PyReject {
     #[new]
-    fn new(invoke_id: i64, problem: Vec<u8>) -> Self {
-        Self { invoke_id, problem }
-    }
-
-    /// The opaque problem code as `bytes`.
-    #[getter]
-    fn problem<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
-        PyBytes::new(py, &self.problem)
+    fn new(invoke_id: Option<InvokeId>, problem_type: u8, problem_code: i64) -> PyResult<Self> {
+        problem_from_parts(problem_type, problem_code)?;
+        Ok(Self {
+            invoke_id,
+            problem_type,
+            problem_code,
+        })
     }
 
     #[setter]
-    fn set_problem(&mut self, problem: Vec<u8>) {
-        self.problem = problem;
+    fn set_problem_type(&mut self, problem_type: u8) -> PyResult<()> {
+        problem_from_parts(problem_type, self.problem_code)?;
+        self.problem_type = problem_type;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
-        format!("Reject(invoke_id={})", self.invoke_id)
+        match self.to_core() {
+            Ok(reject) => format!("Reject({})", Component::Reject(reject)),
+            Err(_) => "Reject(invalid)".to_string(),
+        }
     }
 }
 
 impl PyReject {
-    fn to_core(&self) -> Reject {
-        Reject {
+    fn to_core(&self) -> PyResult<Reject> {
+        Ok(Reject {
             invoke_id: self.invoke_id,
-            problem: Any::new(self.problem.clone()),
-        }
+            problem: problem_from_parts(self.problem_type, self.problem_code)?,
+        })
     }
 
     fn from_core(rj: Reject) -> Self {
+        let (problem_type, problem_code) = problem_parts(rj.problem);
         Self {
             invoke_id: rj.invoke_id,
-            problem: rj.problem.as_bytes().to_vec(),
+            problem_type,
+            problem_code,
         }
     }
 }
@@ -478,7 +543,7 @@ fn py_component_to_core(py: Python<'_>, obj: &Py<PyAny>) -> PyResult<Component> 
     } else if let Ok(re) = bound.extract::<PyReturnError>() {
         Ok(Component::ReturnError(re.to_core()))
     } else if let Ok(rj) = bound.extract::<PyReject>() {
-        Ok(Component::Reject(rj.to_core()))
+        Ok(Component::Reject(rj.to_core()?))
     } else {
         Err(TcapError::new_err(
             "component must be an Invoke, ReturnResult, ReturnError, or Reject",
@@ -732,19 +797,51 @@ impl PyEnd {
     }
 }
 
+// ── P-Abort causes (Q.773 Table 12) ─────────────────────────────────────────
+/// P-Abort cause: unrecognizedMessageType (0).
+pub const P_ABORT_UNRECOGNIZED_MESSAGE_TYPE: i64 = 0;
+/// P-Abort cause: unrecognizedTransactionID (1).
+pub const P_ABORT_UNRECOGNIZED_TRANSACTION_ID: i64 = 1;
+/// P-Abort cause: badlyFormattedTransactionPortion (2).
+pub const P_ABORT_BADLY_FORMATTED_TRANSACTION_PORTION: i64 = 2;
+/// P-Abort cause: incorrectTransactionPortion (3).
+pub const P_ABORT_INCORRECT_TRANSACTION_PORTION: i64 = 3;
+/// P-Abort cause: resourceLimitation (4).
+pub const P_ABORT_RESOURCE_LIMITATION: i64 = 4;
+
 /// A TCAP **Abort** transaction (`[APPLICATION 7]`) — aborts a dialogue.
+///
+/// The reason is a choice: `p_abort_cause` (an `int`, see `P_ABORT_*`) when
+/// the transaction sub-layer aborts, or `dialogue_portion` (the `EXTERNAL`
+/// `bytes`: an ABRT or AARE APDU, or user information) when the user or the
+/// component sub-layer aborts. At most one of the two; neither is an abort by
+/// the user without information.
 #[pyclass(name = "Abort", module = "tcap._tcap", skip_from_py_object)]
 pub struct PyAbort {
     dtid: Vec<u8>,
-    reason: Option<Vec<u8>>,
+    p_abort_cause: Option<i64>,
+    dialogue_portion: Option<Vec<u8>>,
 }
 
 #[pymethods]
 impl PyAbort {
     #[new]
-    #[pyo3(signature = (dtid, *, reason = None))]
-    fn new(dtid: Vec<u8>, reason: Option<Vec<u8>>) -> Self {
-        Self { dtid, reason }
+    #[pyo3(signature = (dtid, *, p_abort_cause = None, dialogue_portion = None))]
+    fn new(
+        dtid: Vec<u8>,
+        p_abort_cause: Option<i64>,
+        dialogue_portion: Option<Vec<u8>>,
+    ) -> PyResult<Self> {
+        if p_abort_cause.is_some() && dialogue_portion.is_some() {
+            return Err(TcapError::new_err(
+                "an Abort carries a P-Abort cause or a dialogue portion, not both",
+            ));
+        }
+        Ok(Self {
+            dtid,
+            p_abort_cause,
+            dialogue_portion,
+        })
     }
 
     /// Destination Transaction ID (`bytes`).
@@ -753,24 +850,58 @@ impl PyAbort {
         PyBytes::new(py, &self.dtid)
     }
 
-    /// The abort reason (opaque P-Abort cause / dialogue ABRT BER), or `None`.
+    /// The P-Abort cause (`int`), or `None`.
     #[getter]
-    fn reason<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
-        self.reason.as_ref().map(|r| PyBytes::new(py, r))
+    fn p_abort_cause(&self) -> Option<i64> {
+        self.p_abort_cause
+    }
+
+    /// The user abort information: the dialogue-portion `EXTERNAL` as `bytes`,
+    /// or `None`.
+    #[getter]
+    fn dialogue_portion<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.dialogue_portion.as_ref().map(|d| PyBytes::new(py, d))
     }
 
     /// Encode this Abort to Q.773-compliant BER `bytes`.
     fn encode<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let abort = Abort {
-            dtid: OctetString::from(self.dtid.clone()),
-            reason: self.reason.clone().map(Any::new),
-        };
-        let bytes = crate::encode(&TcapMessage::Abort(abort)).map_err(tcap_err)?;
+        let bytes = crate::encode(&TcapMessage::Abort(self.to_core())).map_err(tcap_err)?;
         Ok(PyBytes::new(py, &bytes))
     }
 
     fn __repr__(&self) -> String {
-        format!("Abort(dtid={})", hex::encode(&self.dtid))
+        format!("{}", TcapMessage::Abort(self.to_core()))
+    }
+}
+
+impl PyAbort {
+    fn to_core(&self) -> Abort {
+        let reason = match (&self.p_abort_cause, &self.dialogue_portion) {
+            (Some(cause), _) => Some(AbortReason::PAbort(PAbortCause(*cause))),
+            (None, Some(portion)) => Some(AbortReason::UAbort(DialoguePortion {
+                external: Any::new(portion.clone()),
+            })),
+            (None, None) => None,
+        };
+        Abort {
+            dtid: OctetString::from(self.dtid.clone()),
+            reason,
+        }
+    }
+
+    fn from_core(abort: Abort) -> Self {
+        let (p_abort_cause, dialogue_portion) = match abort.reason {
+            Some(AbortReason::PAbort(cause)) => (Some(cause.value()), None),
+            Some(AbortReason::UAbort(portion)) => {
+                (None, Some(portion.external.as_bytes().to_vec()))
+            }
+            None => (None, None),
+        };
+        Self {
+            dtid: abort.dtid.to_vec(),
+            p_abort_cause,
+            dialogue_portion,
+        }
     }
 }
 
@@ -832,11 +963,12 @@ fn oid_from_arcs(arcs: Vec<u32>) -> PyResult<ObjectIdentifier> {
     ObjectIdentifier::new(arcs).ok_or_else(|| TcapError::new_err("invalid object identifier arcs"))
 }
 
-/// A decoded TCAP dialogue PDU (AARQ / AARE / ABRT), as read back from a
+/// A decoded TCAP dialogue PDU (AARQ / AARE / ABRT / AUDT), as read back from a
 /// message's `dialogue_portion` by [`parse_dialogue_portion`].
 ///
-/// Inspect `.pdu_type` (`"AARQ"` / `"AARE"` / `"ABRT"`); AARQ/AARE expose
-/// `.application_context` (OID arcs) and AARE also `.result` (0 = accepted) and
+/// Inspect `.pdu_type` (`"AARQ"` / `"AARE"` / `"ABRT"` / `"AUDT"`); AARQ, AARE
+/// and AUDT expose `.application_context` (OID arcs) and `.version1`; AARE also
+/// `.result` (0 = accepted, 1 = reject-permanent) and
 /// `.result_source_diagnostic` (a `(source, value)` pair, source 1 = user,
 /// 2 = provider); ABRT exposes `.abort_source` (0 = user, 1 = provider).
 #[pyclass(name = "DialoguePdu", module = "tcap._tcap", skip_from_py_object)]
@@ -846,17 +978,18 @@ pub struct PyDialoguePdu {
 
 #[pymethods]
 impl PyDialoguePdu {
-    /// `"AARQ"`, `"AARE"`, or `"ABRT"`.
+    /// `"AARQ"`, `"AARE"`, `"ABRT"`, or `"AUDT"`.
     #[getter]
     fn pdu_type(&self) -> &'static str {
         match &self.inner {
             CoreDialoguePdu::Aarq { .. } => "AARQ",
             CoreDialoguePdu::Aare { .. } => "AARE",
             CoreDialoguePdu::Abrt { .. } => "ABRT",
+            CoreDialoguePdu::Audt { .. } => "AUDT",
         }
     }
 
-    /// The application-context-name OID arcs (AARQ / AARE), else `None`.
+    /// The application-context-name OID arcs (AARQ / AARE / AUDT), else `None`.
     #[getter]
     fn application_context(&self) -> Option<Vec<u32>> {
         match &self.inner {
@@ -867,13 +1000,36 @@ impl PyDialoguePdu {
             | CoreDialoguePdu::Aare {
                 application_context_name,
                 ..
+            }
+            | CoreDialoguePdu::Audt {
+                application_context_name,
+                ..
             } => Some(application_context_name.to_vec()),
             CoreDialoguePdu::Abrt { .. } => None,
         }
     }
 
-    /// The associate result INTEGER (AARE only): 0 accepted, 1 reject-permanent,
-    /// 2 reject-transient. `None` for AARQ / ABRT.
+    /// Whether the protocol version lists version 1 (AARQ / AARE / AUDT), else
+    /// `None`. An AARQ with `False` is answered with
+    /// `dialogue_aare_reject(context, 2, 2)` in an Abort (Q.774 3.2.3).
+    #[getter]
+    fn version1(&self) -> Option<bool> {
+        match &self.inner {
+            CoreDialoguePdu::Aarq {
+                protocol_version, ..
+            }
+            | CoreDialoguePdu::Aare {
+                protocol_version, ..
+            }
+            | CoreDialoguePdu::Audt {
+                protocol_version, ..
+            } => Some(*protocol_version == ProtocolVersion::Version1),
+            CoreDialoguePdu::Abrt { .. } => None,
+        }
+    }
+
+    /// The associate result INTEGER (AARE only): 0 accepted, 1 reject-permanent.
+    /// `None` for the other PDUs.
     #[getter]
     fn result(&self) -> Option<i64> {
         match &self.inner {
@@ -907,7 +1063,8 @@ impl PyDialoguePdu {
         }
     }
 
-    /// The opaque user-information `[30]` content octets, if present.
+    /// The user-information `[30]` content octets, if present: the encodings
+    /// of its `EXTERNAL` values, one after the other.
     #[getter]
     fn user_information<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
         let ui = match &self.inner {
@@ -919,9 +1076,15 @@ impl PyDialoguePdu {
             }
             | CoreDialoguePdu::Abrt {
                 user_information, ..
+            }
+            | CoreDialoguePdu::Audt {
+                user_information, ..
             } => user_information.as_ref(),
         };
-        ui.map(|b| PyBytes::new(py, b))
+        ui.map(|externals| {
+            let content: Vec<u8> = externals.iter().flat_map(External::encode).collect();
+            PyBytes::new(py, &content)
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -954,8 +1117,48 @@ fn dialogue_aare_accept<'py>(
     Ok(PyBytes::new(py, dp.external.as_bytes()))
 }
 
+/// Build a refusing **AARE** dialogue portion (result reject-permanent(1))
+/// carrying `application_context` (OID arcs) and the diagnostic `(source,
+/// value)`: source 1 = dialogue-service-user, 2 = dialogue-service-provider.
+/// It travels as the `dialogue_portion` of an Abort. `(2, 2)` is the answer to
+/// an AARQ that does not list protocol version 1 (Q.774 3.2.3).
+#[pyfunction]
+fn dialogue_aare_reject<'py>(
+    py: Python<'py>,
+    application_context: Vec<u32>,
+    source: i64,
+    value: i64,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let oid = oid_from_arcs(application_context)?;
+    let diagnostic = match source {
+        1 => AssociateSourceDiagnostic::DialogueServiceUser(value),
+        2 => AssociateSourceDiagnostic::DialogueServiceProvider(value),
+        _ => {
+            return Err(TcapError::new_err(
+                "source must be 1 (dialogue-service-user) or 2 (dialogue-service-provider)",
+            ))
+        }
+    };
+    let dp = DialoguePortion::aare_reject(&oid, diagnostic);
+    Ok(PyBytes::new(py, dp.external.as_bytes()))
+}
+
+/// Build an **AUDT** dialogue portion carrying `application_context` (OID
+/// arcs), for a Unidirectional, returning the `EXTERNAL` `bytes`.
+#[pyfunction]
+fn dialogue_audt<'py>(
+    py: Python<'py>,
+    application_context: Vec<u32>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let oid = oid_from_arcs(application_context)?;
+    let dp = DialoguePortion::audt(&oid);
+    Ok(PyBytes::new(py, dp.external.as_bytes()))
+}
+
 /// Build an **ABRT** dialogue portion for `abort_source` (0 = user,
 /// 1 = provider; see `ABORT_SOURCE_*`), returning the `EXTERNAL` `bytes`.
+/// `dialogue_abrt(ABORT_SOURCE_PROVIDER)` is what the component sub-layer
+/// sends for an incorrect dialogue portion (Q.774 3.2.2.1).
 #[pyfunction]
 fn dialogue_abrt<'py>(py: Python<'py>, abort_source: i64) -> PyResult<Bound<'py, PyBytes>> {
     let source = match abort_source {
@@ -974,20 +1177,162 @@ fn dialogue_abrt<'py>(py: Python<'py>, abort_source: i64) -> PyResult<Bound<'py,
 }
 
 /// Parse a dialogue portion (the `EXTERNAL` `bytes` from a decoded message's
-/// `dialogue_portion`) into a `DialoguePdu`, or `None` if it is not a
-/// well-formed AARQ / AARE / ABRT.
+/// `dialogue_portion`).
+///
+/// Returns a `DialoguePdu` for an AARQ / AARE / ABRT / AUDT, and `None` for a
+/// well-formed `EXTERNAL` that carries something else (user information in a
+/// user-defined abstract syntax). Raises `TcapError` when the portion is
+/// malformed.
 #[pyfunction]
 fn parse_dialogue_portion(py: Python<'_>, data: &[u8]) -> PyResult<Option<Py<PyAny>>> {
     let dp = DialoguePortion {
         external: Any::new(data.to_vec()),
     };
-    match dp.dialogue_pdu() {
-        Some(pdu) => Ok(Some(
+    match dp.parse() {
+        Ok(DialogueContent::Pdu(pdu)) => Ok(Some(
             Bound::new(py, PyDialoguePdu { inner: pdu })?
                 .into_any()
                 .unbind(),
         )),
-        None => Ok(None),
+        Ok(DialogueContent::Unmodelled(_)) => Ok(None),
+        Err(error) => Err(TcapError::new_err(error.to_string())),
+    }
+}
+
+// ── What a damaged message yields ───────────────────────────────────────────
+/// A message that was not fully understood, with what Q.774 needs to answer it.
+///
+/// * `sublayer`: `"transaction"` or `"component"`, the sub-layer that detected
+///   the problem.
+/// * `fault`: `"transaction_portion"`, `"dialogue_portion"` or `"component"`.
+/// * `p_abort_cause`: the P-Abort cause for a transaction portion fault.
+/// * `general_problem`, `component_index`, `component_type`, `invoke_id`: for a
+///   component fault, the general problem code, the position of the component,
+///   its type (`COMPONENT_*`, `None` if not recognized) and its invoke ID
+///   (`None` if not derivable).
+/// * `message_type`: the message tag (`TAG_*`), `None` if not recognized.
+/// * `otid` / `dtid`: the transaction IDs that are derivable.
+/// * `partial`: for a component fault, the message with the components before
+///   the faulty one, which stand.
+/// * `abort()` / `reject()`: the `Abort` message or the `Reject` component to
+///   send, or `None` when Q.774 calls for none.
+#[pyclass(name = "DecodeProblem", module = "tcap._tcap", skip_from_py_object)]
+pub struct PyDecodeProblem {
+    inner: DecodeProblem,
+}
+
+#[pymethods]
+impl PyDecodeProblem {
+    #[getter]
+    fn sublayer(&self) -> &'static str {
+        match self.inner.sublayer() {
+            Sublayer::Transaction => "transaction",
+            Sublayer::Component => "component",
+        }
+    }
+
+    #[getter]
+    fn fault(&self) -> &'static str {
+        match self.inner.fault {
+            Fault::TransactionPortion { .. } => "transaction_portion",
+            Fault::DialoguePortion => "dialogue_portion",
+            Fault::Component { .. } => "component",
+        }
+    }
+
+    #[getter]
+    fn p_abort_cause(&self) -> Option<i64> {
+        self.inner.p_abort_cause().map(PAbortCause::value)
+    }
+
+    #[getter]
+    fn general_problem(&self) -> Option<i64> {
+        match self.inner.fault {
+            Fault::Component { problem, .. } => Some(problem.value()),
+            _ => None,
+        }
+    }
+
+    #[getter]
+    fn component_index(&self) -> Option<usize> {
+        match self.inner.fault {
+            Fault::Component { index, .. } => Some(index),
+            _ => None,
+        }
+    }
+
+    #[getter]
+    fn component_type(&self) -> Option<u8> {
+        match self.inner.fault {
+            Fault::Component { component_type, .. } => component_type.map(|t| t.tag()),
+            _ => None,
+        }
+    }
+
+    #[getter]
+    fn invoke_id(&self) -> Option<InvokeId> {
+        match self.inner.fault {
+            Fault::Component { invoke_id, .. } => invoke_id,
+            _ => None,
+        }
+    }
+
+    /// The message tag octet (`TAG_BEGIN` and so on), or `None`.
+    #[getter]
+    fn message_type(&self) -> Option<u8> {
+        self.inner.message_type.map(|t| 0x60 | t.tag())
+    }
+
+    #[getter]
+    fn otid<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.inner.otid.as_ref().map(|id| PyBytes::new(py, id))
+    }
+
+    #[getter]
+    fn dtid<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.inner.dtid.as_ref().map(|id| PyBytes::new(py, id))
+    }
+
+    #[getter]
+    fn partial(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.inner
+            .partial
+            .clone()
+            .map(|message| message_to_py(py, message))
+            .transpose()
+    }
+
+    #[getter]
+    fn detail(&self) -> &str {
+        &self.inner.detail
+    }
+
+    /// The `Abort` to send to the originator, or `None`.
+    fn abort(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.inner
+            .abort()
+            .map(|abort| {
+                Ok(Bound::new(py, PyAbort::from_core(abort))?
+                    .into_any()
+                    .unbind())
+            })
+            .transpose()
+    }
+
+    /// The `Reject` component to send, or `None`.
+    fn reject(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.inner
+            .reject()
+            .map(|reject| {
+                Ok(Bound::new(py, PyReject::from_core(reject))?
+                    .into_any()
+                    .unbind())
+            })
+            .transpose()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("DecodeProblem({})", self.inner)
     }
 }
 
@@ -1013,11 +1358,8 @@ fn encode<'py>(py: Python<'py>, message: &Bound<'py, PyAny>) -> PyResult<Bound<'
     }
 }
 
-/// Decode a TCAP message from BER `bytes`, returning the matching message class
-/// (`Begin`, `Continue`, `End`, `Abort`, or `Unidirectional`).
-#[pyfunction]
-fn decode(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyAny>> {
-    let msg = crate::decode(data).map_err(tcap_err)?;
+/// The Python message object for a core message.
+fn message_to_py(py: Python<'_>, msg: TcapMessage) -> PyResult<Py<PyAny>> {
     let any = match msg {
         TcapMessage::Begin(b) => {
             let components = components_to_py(py, b.components.unwrap_or_default())?;
@@ -1056,14 +1398,7 @@ fn decode(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyAny>> {
             )?
             .into_any()
         }
-        TcapMessage::Abort(a) => Bound::new(
-            py,
-            PyAbort {
-                dtid: a.dtid.to_vec(),
-                reason: a.reason.map(|r| r.as_bytes().to_vec()),
-            },
-        )?
-        .into_any(),
+        TcapMessage::Abort(a) => Bound::new(py, PyAbort::from_core(a))?.into_any(),
         TcapMessage::Unidirectional(u) => {
             let components = components_to_py(py, u.components)?;
             Bound::new(
@@ -1077,6 +1412,32 @@ fn decode(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyAny>> {
         }
     };
     Ok(any.unbind())
+}
+
+/// Decode a TCAP message from BER `bytes`, returning the matching message class
+/// (`Begin`, `Continue`, `End`, `Abort`, or `Unidirectional`).
+///
+/// The message has to be fully valid. When any part of it was not understood,
+/// `TcapError` is raised and its `problem` attribute holds the `DecodeProblem`;
+/// a message is never returned without something that was on the wire.
+#[pyfunction]
+fn decode(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyAny>> {
+    match crate::decode_detailed(data) {
+        Decoded::Complete(message) => message_to_py(py, message),
+        Decoded::Problem(problem) => Err(malformed_err(py, *problem)),
+    }
+}
+
+/// Decode a TCAP message from BER `bytes` without raising: returns the message
+/// object when it was fully understood, and a `DecodeProblem` otherwise.
+#[pyfunction]
+fn decode_detailed(py: Python<'_>, data: &[u8]) -> PyResult<Py<PyAny>> {
+    match crate::decode_detailed(data) {
+        Decoded::Complete(message) => message_to_py(py, message),
+        Decoded::Problem(problem) => Ok(Bound::new(py, PyDecodeProblem { inner: *problem })?
+            .into_any()
+            .unbind()),
+    }
 }
 
 // ── Module wiring ───────────────────────────────────────────────────────────
@@ -1104,7 +1465,9 @@ fn add_contents(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDialoguePdu>()?;
     m.add_function(wrap_pyfunction!(dialogue_aarq, m)?)?;
     m.add_function(wrap_pyfunction!(dialogue_aare_accept, m)?)?;
+    m.add_function(wrap_pyfunction!(dialogue_aare_reject, m)?)?;
     m.add_function(wrap_pyfunction!(dialogue_abrt, m)?)?;
+    m.add_function(wrap_pyfunction!(dialogue_audt, m)?)?;
     m.add_function(wrap_pyfunction!(parse_dialogue_portion, m)?)?;
     m.add("ABORT_SOURCE_USER", ABORT_SOURCE_USER)?;
     m.add("ABORT_SOURCE_PROVIDER", ABORT_SOURCE_PROVIDER)?;
@@ -1112,6 +1475,46 @@ fn add_contents(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Codec.
     m.add_function(wrap_pyfunction!(encode, m)?)?;
     m.add_function(wrap_pyfunction!(decode, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_detailed, m)?)?;
+    m.add_class::<PyDecodeProblem>()?;
+
+    // P-Abort causes (Q.773 Table 12).
+    m.add(
+        "P_ABORT_UNRECOGNIZED_MESSAGE_TYPE",
+        P_ABORT_UNRECOGNIZED_MESSAGE_TYPE,
+    )?;
+    m.add(
+        "P_ABORT_UNRECOGNIZED_TRANSACTION_ID",
+        P_ABORT_UNRECOGNIZED_TRANSACTION_ID,
+    )?;
+    m.add(
+        "P_ABORT_BADLY_FORMATTED_TRANSACTION_PORTION",
+        P_ABORT_BADLY_FORMATTED_TRANSACTION_PORTION,
+    )?;
+    m.add(
+        "P_ABORT_INCORRECT_TRANSACTION_PORTION",
+        P_ABORT_INCORRECT_TRANSACTION_PORTION,
+    )?;
+    m.add("P_ABORT_RESOURCE_LIMITATION", P_ABORT_RESOURCE_LIMITATION)?;
+
+    // Reject problem classes (Q.773 Table 25) and the general problems the
+    // component sub-layer raises (Table 26).
+    m.add("PROBLEM_GENERAL", PROBLEM_GENERAL)?;
+    m.add("PROBLEM_INVOKE", PROBLEM_INVOKE)?;
+    m.add("PROBLEM_RETURN_RESULT", PROBLEM_RETURN_RESULT)?;
+    m.add("PROBLEM_RETURN_ERROR", PROBLEM_RETURN_ERROR)?;
+    m.add(
+        "GENERAL_PROBLEM_UNRECOGNIZED_COMPONENT",
+        GeneralProblem::UNRECOGNIZED_COMPONENT.value(),
+    )?;
+    m.add(
+        "GENERAL_PROBLEM_MISTYPED_COMPONENT",
+        GeneralProblem::MISTYPED_COMPONENT.value(),
+    )?;
+    m.add(
+        "GENERAL_PROBLEM_BADLY_STRUCTURED_COMPONENT",
+        GeneralProblem::BADLY_STRUCTURED_COMPONENT.value(),
+    )?;
 
     // Q.773 transaction PDU tags (the first BER byte of an encoded message).
     m.add("TAG_UNIDIRECTIONAL", TAG_UNIDIRECTIONAL)?;

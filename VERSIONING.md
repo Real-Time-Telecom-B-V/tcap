@@ -1,10 +1,12 @@
 # Versioning
 
 `tcap` follows [Semantic Versioning 2.0.0](https://semver.org/). The public API
-— the `encode` / `decode` functions, the `TcapMessage` transaction types, the
-`Component` / `Invoke` / `ReturnResult` / `ReturnError` / `Reject` component
-types, `OperationCode` / `ErrorCode`, `DialoguePortion`, and `TcapError` — is
-the contract, along with the wire format they produce.
+— the `encode` / `decode` / `decode_detailed` functions, the `TcapMessage`
+transaction types, the `Component` / `Invoke` / `ReturnResult` / `ReturnError` /
+`Reject` component types, `OperationCode` / `ErrorCode`, the P-Abort cause and
+problem codes, `DialoguePortion` and the dialogue PDU types, `Decoded` /
+`DecodeProblem`, and `TcapError` — is the contract, along with the wire format
+they produce.
 
 ## The git tag is the source of truth
 

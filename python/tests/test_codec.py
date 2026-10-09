@@ -128,7 +128,12 @@ def test_end_with_return_result_round_trip() -> None:
 
 
 def test_return_result_not_last_preserved() -> None:
-    rr = tcap.ReturnResult(2, operation_code=tcap.OperationCode.local(46), last=False)
+    rr = tcap.ReturnResult(
+        2,
+        operation_code=tcap.OperationCode.local(46),
+        parameter=bytes([0x05, 0x00]),
+        last=False,
+    )
     cont = tcap.Continue(b"\xAA", b"\xBB", components=[rr])
     decoded = tcap.decode(cont.encode())
     result = decoded.components[0]
@@ -158,20 +163,38 @@ def test_continue_tag_and_round_trip() -> None:
 
 
 # ── Abort ────────────────────────────────────────────────────────────────────
-def test_abort_round_trip() -> None:
-    abort = tcap.Abort(b"\x03", reason=bytes([0x0A, 0x01, 0x01]))  # synthetic P-Abort
+def test_abort_p_abort_round_trip() -> None:
+    abort = tcap.Abort(b"\x03", p_abort_cause=tcap.P_ABORT_UNRECOGNIZED_TRANSACTION_ID)
     wire = abort.encode()
-    assert wire[0] == 0x67  # [APPLICATION 7] CONSTRUCTED
+    # Abort [APPLICATION 7], dtid 03, P-AbortCause [APPLICATION 10] INTEGER 1.
+    assert wire == bytes([0x67, 0x06, 0x49, 0x01, 0x03, 0x4A, 0x01, 0x01])
     decoded = tcap.decode(wire)
     assert isinstance(decoded, tcap.Abort)
     assert decoded.dtid == b"\x03"
-    assert decoded.reason == bytes([0x0A, 0x01, 0x01])
+    assert decoded.p_abort_cause == 1
+    assert decoded.dialogue_portion is None
+
+
+def test_abort_u_abort_round_trip() -> None:
+    abrt = tcap.dialogue_abrt(tcap.ABORT_SOURCE_USER)
+    decoded = tcap.decode(tcap.Abort(b"\x03", dialogue_portion=abrt).encode())
+    assert isinstance(decoded, tcap.Abort)
+    assert decoded.p_abort_cause is None
+    assert decoded.dialogue_portion == abrt
+    pdu = tcap.parse_dialogue_portion(decoded.dialogue_portion)
+    assert pdu is not None and pdu.pdu_type == "ABRT"
 
 
 def test_abort_no_reason() -> None:
     decoded = tcap.decode(tcap.Abort(b"\x03").encode())
     assert isinstance(decoded, tcap.Abort)
-    assert decoded.reason is None
+    assert decoded.p_abort_cause is None
+    assert decoded.dialogue_portion is None
+
+
+def test_abort_takes_one_reason() -> None:
+    with pytest.raises(tcap.TcapError):
+        tcap.Abort(b"\x03", p_abort_cause=0, dialogue_portion=tcap.dialogue_abrt(0))
 
 
 # ── Unidirectional ───────────────────────────────────────────────────────────
@@ -187,14 +210,38 @@ def test_unidirectional_round_trip() -> None:
 
 # ── Reject ───────────────────────────────────────────────────────────────────
 def test_reject_round_trip() -> None:
-    # general problem: unrecognized component (synthetic problem BER)
-    reject = tcap.Reject(99, bytes([0x80, 0x01, 0x01]))
+    reject = tcap.Reject(
+        99, tcap.PROBLEM_GENERAL, tcap.GENERAL_PROBLEM_MISTYPED_COMPONENT
+    )
     end = tcap.End(b"\x01", components=[reject])
-    decoded = tcap.decode(end.encode())
-    rj = decoded.components[0]
+    wire = end.encode()
+    # End, dtid 01, one reject [4] { INTEGER 99, generalProblem [0] 1 }.
+    assert wire == bytes.fromhex("640d4901016c08a40602016380 0101".replace(" ", ""))
+    rj = tcap.decode(wire).components[0]
     assert isinstance(rj, tcap.Reject)
     assert rj.invoke_id == 99
-    assert rj.problem == bytes([0x80, 0x01, 0x01])
+    assert rj.problem_type == tcap.PROBLEM_GENERAL
+    assert rj.problem_code == tcap.GENERAL_PROBLEM_MISTYPED_COMPONENT
+
+
+def test_reject_without_an_invoke_id() -> None:
+    # The invoke ID could not be derived: a NULL on the wire.
+    reject = tcap.Reject(None, tcap.PROBLEM_GENERAL, 0)
+    wire = tcap.End(b"\x01", components=[reject]).encode()
+    assert wire == bytes.fromhex("640c4901016c07a4050500800100")
+    assert tcap.decode(wire).components[0].invoke_id is None
+
+
+def test_reject_problem_type_is_checked() -> None:
+    with pytest.raises(tcap.TcapError):
+        tcap.Reject(1, 4, 0)
+
+
+def test_invoke_id_range() -> None:
+    # InvokeIdType ::= INTEGER (-128..127)
+    with pytest.raises(OverflowError):
+        tcap.Invoke(128, tcap.OperationCode.local(1))
+    assert tcap.Invoke(-128, tcap.OperationCode.local(1)).invoke_id == -128
 
 
 # ── Multiple components ──────────────────────────────────────────────────────
@@ -218,8 +265,9 @@ def test_module_encode_matches_method() -> None:
 
 # ── dialogue portion ─────────────────────────────────────────────────────────
 def test_dialogue_portion_round_trip() -> None:
-    # Synthetic EXTERNAL-shaped bytes (tag 0x28 = [UNIVERSAL 8] EXTERNAL).
-    dp = bytes([0x28, 0x03, 0x06, 0x01, 0x2A])
+    # A synthetic EXTERNAL (tag 0x28 = [UNIVERSAL 8]) in the made-up abstract
+    # syntax 2.999.1, holding an OCTET STRING as a single-ASN1-type.
+    dp = bytes.fromhex("280a0603883701a003040101")
     begin = tcap.Begin(b"\x01", dialogue_portion=dp)
     decoded = tcap.decode(begin.encode())
     assert decoded.dialogue_portion == dp
@@ -312,6 +360,88 @@ def test_dialogue_aarq_rejects_bad_oid() -> None:
         tcap.dialogue_aarq([3, 0, 0])  # first arc > 2 is not a valid OID
 
 
-def test_parse_non_dialogue_returns_none() -> None:
-    # A well-formed EXTERNAL but not the dialogue-as OID — not a dialogue PDU.
-    assert tcap.parse_dialogue_portion(bytes([0x28, 0x03, 0x06, 0x01, 0x2A])) is None
+def test_parse_user_defined_syntax_returns_none() -> None:
+    # A well-formed EXTERNAL in the made-up abstract syntax 2.999.1, holding an
+    # OCTET STRING: not a dialogue PDU, and not an error.
+    external = bytes.fromhex("280a0603883701a003040101")
+    assert tcap.parse_dialogue_portion(external) is None
+
+
+def test_parse_malformed_dialogue_raises() -> None:
+    # An EXTERNAL without its encoding member.
+    with pytest.raises(tcap.TcapError):
+        tcap.parse_dialogue_portion(bytes([0x28, 0x03, 0x06, 0x01, 0x2A]))
+    # An AARQ holding an INTEGER where the application context name belongs.
+    with pytest.raises(tcap.TcapError):
+        tcap.parse_dialogue_portion(
+            bytes.fromhex("2816060700118605010101a00b600980020780a103020105")
+        )
+
+
+def test_dialogue_aare_reject_and_audt() -> None:
+    pdu = tcap.parse_dialogue_portion(tcap.dialogue_aare_reject(MAP_SRI_SM_AC, 2, 2))
+    assert pdu is not None
+    assert (pdu.pdu_type, pdu.result, pdu.result_source_diagnostic) == ("AARE", 1, (2, 2))
+    pdu = tcap.parse_dialogue_portion(tcap.dialogue_audt(MAP_SRI_SM_AC))
+    assert pdu is not None
+    assert (pdu.pdu_type, pdu.version1) == ("AUDT", True)
+
+
+# ── A message that is not fully understood ───────────────────────────────────
+# A Begin whose second Invoke stops after its invoke ID.
+DROPPED_LAST = bytes.fromhex("62154804000010016c0da10602010102013aa103020102")
+
+
+def test_decode_raises_with_the_problem_attached() -> None:
+    with pytest.raises(tcap.TcapError) as caught:
+        tcap.decode(DROPPED_LAST)
+    problem = caught.value.problem
+    assert isinstance(problem, tcap.DecodeProblem)
+    assert problem.sublayer == "component"
+    assert problem.fault == "component"
+    assert problem.component_index == 1
+    assert problem.component_type == tcap.COMPONENT_INVOKE
+    assert problem.invoke_id == 2
+    assert problem.general_problem == tcap.GENERAL_PROBLEM_MISTYPED_COMPONENT
+    assert problem.message_type == tcap.TAG_BEGIN
+    assert problem.otid == bytes.fromhex("00001001")
+    # The component before the faulty one stands.
+    assert [c.invoke_id for c in problem.partial.components] == [1]
+    reject = problem.reject()
+    assert (reject.invoke_id, reject.problem_type, reject.problem_code) == (2, 0, 1)
+    assert problem.abort() is None
+
+
+def test_decode_detailed_returns_the_problem() -> None:
+    # Octets after the end of the message.
+    wire = tcap.Begin(b"\x00\x00\x10\x01").encode() + b"\x00"
+    problem = tcap.decode_detailed(wire)
+    assert isinstance(problem, tcap.DecodeProblem)
+    assert problem.sublayer == "transaction"
+    assert problem.p_abort_cause == tcap.P_ABORT_BADLY_FORMATTED_TRANSACTION_PORTION
+    assert problem.partial is None and problem.reject() is None
+    abort = problem.abort()
+    assert abort.dtid == bytes.fromhex("00001001")
+    assert abort.encode() == bytes.fromhex("67094904000010014a0102")
+
+
+def test_decode_detailed_returns_the_message() -> None:
+    wire = tcap.Begin(b"\x01").encode()
+    assert isinstance(tcap.decode_detailed(wire), tcap.Begin)
+
+
+def test_malformed_dialogue_portion_is_answered_with_an_abrt() -> None:
+    wire = bytes.fromhex(
+        "62204804000010016b182816060700118605010101a00b600980020780a103020105"
+    )
+    problem = tcap.decode_detailed(wire)
+    assert problem.fault == "dialogue_portion"
+    abort = problem.abort()
+    assert abort.dialogue_portion == tcap.dialogue_abrt(tcap.ABORT_SOURCE_PROVIDER)
+
+
+def test_transaction_id_length_is_checked() -> None:
+    with pytest.raises(tcap.TcapError):
+        tcap.Begin(b"\x01\x02\x03\x04\x05").encode()
+    with pytest.raises(tcap.TcapError):
+        tcap.Begin(b"").encode()
