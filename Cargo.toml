@@ -24,7 +24,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # ASN.1 BER encode/decode — TCAP messages are BER (X.690) with APPLICATION/CONTEXT tags.
-rasn = "0.28"
+rasn = "0.29"
 # hex is used for the Display impls (rendering transaction IDs).
 hex = "0.4"
 thiserror = "2"
