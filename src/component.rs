@@ -279,7 +279,7 @@ impl Encode for Reject {
         &self,
         encoder: &mut E,
         tag: Tag,
-        constraints: Constraints,
+        constraints: &Constraints,
         identifier: Identifier,
     ) -> Result<(), E::Error> {
         RejectWire {
@@ -297,7 +297,7 @@ impl Decode for Reject {
     fn decode_with_tag_and_constraints<D: Decoder>(
         decoder: &mut D,
         tag: Tag,
-        constraints: Constraints,
+        constraints: &Constraints,
     ) -> Result<Self, D::Error> {
         let wire = RejectWire::decode_with_tag_and_constraints(decoder, tag, constraints)?;
         Ok(Self {

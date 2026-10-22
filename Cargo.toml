@@ -1,6 +1,6 @@
 [package]
 name = "tcap"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Pure-Rust TCAP (Transaction Capabilities Application Part) codec per ITU-T Q.771-Q.775 — transactions, dialogue, and components over BER"
@@ -24,7 +24,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # ASN.1 BER encode/decode — TCAP messages are BER (X.690) with APPLICATION/CONTEXT tags.
-rasn = "0.28"
+rasn = "0.29"
 # hex is used for the Display impls (rendering transaction IDs).
 hex = "0.4"
 thiserror = "2"
