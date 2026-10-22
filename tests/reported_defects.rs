@@ -1,9 +1,11 @@
 //! The four defects reported against 1.0.0, each reproduced and each closed.
 //!
 //! Every test first shows what `rasn` does on its own with this crate's
-//! types: the decode succeeds and something that was on the wire is gone
-//! (seen on rasn 0.28.14 and 0.28.15). That half documents the library
-//! behaviour; if a future `rasn` stops being lenient it fails and says so.
+//! types. On rasn 0.28 the decode succeeded and something that was on the
+//! wire was gone. rasn 0.29 refuses a malformed component (defects 1 and 2),
+//! and still ignores trailing octets (3) and leaves the dialogue portion
+//! opaque (4). That half documents the library behaviour; if `rasn` changes
+//! it fails and says so.
 //! The second half is what this crate guarantees either way: the message is
 //! not returned as valid, and the caller gets what Q.774 needs for the
 //! response.
@@ -24,6 +26,12 @@ fn lenient(bytes: &[u8]) -> TcapMessage {
         "rasn refused these octets: it no longer has the leniency this test documents, \
          which is good news; adjust the first half of the test",
     )
+}
+
+/// `rasn` alone refuses the octets: since 0.29 it no longer drops a malformed
+/// component.
+fn refused(bytes: &[u8]) -> bool {
+    rasn::ber::decode::<TcapMessage>(bytes).is_err()
 }
 
 fn invoke_58(invoke_id: i8) -> Component {
@@ -49,14 +57,10 @@ fn defect_1_a_lone_malformed_invoke_is_not_an_empty_component_list() {
                   02 01 02          -- invokeID 2, and nothing else",
     );
 
-    match lenient(&wire) {
-        TcapMessage::Begin(begin) => assert_eq!(
-            begin.components,
-            Some(vec![]),
-            "rasn returns an empty list for a portion that held a component"
-        ),
-        other => panic!("{other:?}"),
-    }
+    assert!(
+        refused(&wire),
+        "rasn 0.28 returned an empty list for a portion that held a component"
+    );
 
     let found = problem(&wire);
     assert_eq!(found.sublayer(), Sublayer::Component);
@@ -96,10 +100,9 @@ fn defect_2_a_malformed_last_invoke_is_not_dropped() {
                a1 03 02 01 02            -- invoke 2 without an operation code",
     );
 
-    assert_eq!(
-        lenient(&wire).components(),
-        &[invoke_58(1)],
-        "rasn returns the first component and says nothing of the second"
+    assert!(
+        refused(&wire),
+        "rasn 0.28 returned the first component and said nothing of the second"
     );
 
     let found = problem(&wire);
@@ -136,7 +139,10 @@ fn defect_2_a_last_return_result_with_a_malformed_result_is_not_dropped() {
                   30 02 05 00            -- result SEQUENCE { NULL }",
     );
 
-    assert_eq!(lenient(&wire).components(), &[invoke_58(1)]);
+    assert!(
+        refused(&wire),
+        "rasn 0.28 returned only the first component"
+    );
 
     let found = problem(&wire);
     assert_eq!(

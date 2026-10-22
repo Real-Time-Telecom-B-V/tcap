@@ -5,6 +5,18 @@ All notable changes are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). See
 [VERSIONING.md](VERSIONING.md) for the policy.
 
+## [3.0.0]
+
+### Changed
+- **`rasn` 0.29** (was 0.28). `rasn` types are in the public API
+  (`Any` parameters, `ObjectIdentifier` operation codes and application
+  contexts, the `OctetString` transaction ID), so a caller has to move to
+  rasn 0.29 with this release. Nothing else in the API changed.
+- rasn 0.29 itself refuses a component portion with a malformed component,
+  where 0.28 dropped the component. This crate's decoder already failed on
+  those (2.0.0); the result is the same, the tests of the reported defects now
+  record the new `rasn` behaviour.
+
 ## [2.0.0]
 
 Decoding no longer loses anything silently, and the parts of a message TCAP
