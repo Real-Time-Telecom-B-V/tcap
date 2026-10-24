@@ -34,7 +34,7 @@ thiserror = "2"
 # modules to `gil_used = false`, so the extension loads on free-threaded ("no-GIL")
 # CPython without re-enabling the GIL. abi3-py39 → one forward-compatible wheel for
 # regular CPython 3.9+ (free-threaded wheels are built version-specific instead).
-pyo3 = { version = "0.29", optional = true, features = ["abi3-py39"] }
+pyo3 = { version = "0.30", optional = true, features = ["abi3-py39"] }
 
 [features]
 default = []
